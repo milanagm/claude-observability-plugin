@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -176,6 +177,9 @@ def get_langfuse_config() -> Optional[LangfuseConfig]:
 
     if not public_key or not secret_key:
         return None
+
+    # The configured keys themselves must never appear in uploaded payloads.
+    set_mask_literals([secret_key, public_key])
 
     return LangfuseConfig(
         public_key=public_key,
@@ -604,9 +608,56 @@ def extract_text_from_content(content: Any) -> str:
         return "\n".join([p for p in parts if p])
     return ""
 
+# ---------------------------------------------------------------------------
+# Secret masking (stage 1: Langfuse credentials only)
+#
+# Coding sessions routinely read .env files and shell configs; without
+# masking, the project's own Langfuse keys can end up verbatim inside the
+# very traces they authenticate. We mask (a) anything shaped like a Langfuse
+# key and (b) the literal configured key values — before truncation, so no
+# fragment of a secret ever reaches the payload.
+# ---------------------------------------------------------------------------
+
+LANGFUSE_KEY_PATTERN = re.compile(r"\b(?:sk|pk)-lf-[A-Za-z0-9_-]+\b")
+LANGFUSE_KEY_REDACTED = "[LANGFUSE_KEY_REDACTED]"
+_mask_literals: List[str] = []
+
+def set_mask_literals(secrets: List[Optional[str]]) -> None:
+    """Register the configured key values for literal masking (set at config load)."""
+    global _mask_literals
+    _mask_literals = [s for s in secrets if s]
+
+def mask_secret_text(s: str) -> str:
+    masked = LANGFUSE_KEY_PATTERN.sub(LANGFUSE_KEY_REDACTED, s)
+    for secret in _mask_literals:
+        masked = masked.replace(secret, LANGFUSE_KEY_REDACTED)
+    return masked
+
+def mask_secrets(value: Any, _seen: Optional[set] = None) -> Any:
+    """Recursively mask strings inside dicts/lists; cycle-safe."""
+    if isinstance(value, str):
+        return mask_secret_text(value)
+    if isinstance(value, (dict, list)):
+        if _seen is None:
+            _seen = set()
+        obj_id = id(value)
+        if obj_id in _seen:
+            return "[circular]"
+        _seen.add(obj_id)
+        try:
+            if isinstance(value, list):
+                return [mask_secrets(v, _seen) for v in value]
+            return {k: mask_secrets(v, _seen) for k, v in value.items()}
+        finally:
+            _seen.discard(obj_id)
+    return value
+
 def truncate_text(s: str, max_chars: int = MAX_CHARS) -> Tuple[str, Dict[str, Any]]:
     if s is None:
         return "", {"truncated": False, "orig_len": 0}
+    # Mask before truncating/hashing: the sha256 then fingerprints the masked
+    # text, so even the hash never derives from secret-bearing content.
+    s = mask_secret_text(s)
     orig_len = len(s)
     if orig_len <= max_chars:
         return s, {"truncated": False, "orig_len": orig_len}
@@ -1639,7 +1690,8 @@ def get_tool_input_for_observation(tool_use: Dict[str, Any]) -> Tuple[Any, Optio
     )
     if isinstance(tool_input_raw, str):
         return truncate_text(tool_input_raw)
-    return tool_input_raw, None
+    # Dict/list tool inputs bypass truncate_text, so mask them here.
+    return mask_secrets(tool_input_raw), None
 
 def get_tool_result_for_observation(tool_result_entry: Any) -> ToolResultForObservation:
     if not isinstance(tool_result_entry, dict):
