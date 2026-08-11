@@ -48,6 +48,15 @@ The plugin requires or accepts:
 
 Get keys from your Langfuse project settings → API Keys.
 
+## Update
+
+```bash
+claude plugin marketplace update langfuse-observability
+claude plugin update langfuse-observability@langfuse-observability
+```
+
+The first command gets the latest plugin code from GitHub. The second command installs the plugin. Then restart Claude Code.
+
 ## Requirements
 
 One of:
