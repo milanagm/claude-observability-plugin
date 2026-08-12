@@ -10,6 +10,7 @@ Claude Code -> Langfuse hook
 
 """
 
+import base64
 import contextlib
 import json
 import logging
@@ -38,6 +39,7 @@ def _opt(name: str) -> str:
 DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
+CAPTURE_IMAGES = _opt("CC_LANGFUSE_CAPTURE_IMAGES").lower() == "true"
 try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
 except ValueError:
@@ -306,7 +308,17 @@ except Exception as e:
     )
     sys.exit(0)
 
+# If this import fails, image capture falls back to text markers.
+try:
+    from langfuse.media import LangfuseMedia
+except Exception:
+    LangfuseMedia = None
+
 def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
+    # With capture off, stop the SDK from uploading base64 images it finds
+    # in span payloads on its own. The SDK reads an empty value as enabled.
+    if not CAPTURE_IMAGES and not os.environ.get("LANGFUSE_MEDIA_UPLOAD_ENABLED"):
+        os.environ["LANGFUSE_MEDIA_UPLOAD_ENABLED"] = "false"
     try:
         return Langfuse(
             public_key=config.public_key,
@@ -621,6 +633,43 @@ def parse_timestamp(value: Any) -> Optional[datetime]:
     except Exception:
         return None
 
+def describe_image_block(block: Dict[str, Any]) -> str:
+    """Make a short text marker for an image block's base64 payload."""
+    source = block.get("source") if isinstance(block.get("source"), dict) else {}
+    media_type = source.get("media_type") or "unknown type"
+    data = source.get("data")
+    if isinstance(data, str) and data:
+        return f"[image {media_type} ~{len(data) * 3 // 4 // 1024}KB]"
+    return f"[image {media_type}]"
+
+def media_from_image_block(block: Dict[str, Any]) -> Optional[Any]:
+    """Make a LangfuseMedia for a base64 image block. Return None when
+    capture is off, media support is missing, or the block is malformed.
+    The caller then keeps the text marker."""
+    if not CAPTURE_IMAGES or LangfuseMedia is None:
+        return None
+    source = block.get("source") if isinstance(block.get("source"), dict) else {}
+    media_type = source.get("media_type")
+    data = source.get("data")
+    if source.get("type") != "base64" or not isinstance(media_type, str) or not media_type or not isinstance(data, str) or not data:
+        return None
+    try:
+        # The SDK does not raise on bad base64 and returns a hollow object
+        # that serializes as garbage, so decode here and pass bytes directly.
+        decoded = base64.b64decode("".join(data.split()), validate=True)
+        return LangfuseMedia(content_bytes=decoded, content_type=media_type)
+    except Exception as e:
+        debug(f"LangfuseMedia creation failed ({type(e).__name__}: {e}); keeping text marker only")
+        return None
+
+def get_image_blocks(content: Any) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if isinstance(content, list):
+        for x in content:
+            if isinstance(x, dict) and x.get("type") == "image":
+                out.append(x)
+    return out
+
 def extract_text_from_content(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -629,6 +678,8 @@ def extract_text_from_content(content: Any) -> str:
         for x in content:
             if isinstance(x, dict) and x.get("type") == "text":
                 parts.append(x.get("text", ""))
+            elif isinstance(x, dict) and x.get("type") == "image":
+                parts.append(describe_image_block(x))
             elif isinstance(x, str):
                 parts.append(x)
         return "\n".join([p for p in parts if p])
@@ -1781,13 +1832,36 @@ def get_tool_input_for_observation(tool_use: Dict[str, Any]) -> Tuple[Any, Optio
         return truncate_text(tool_input_raw)
     return tool_input_raw, None
 
+def render_tool_result_content(raw: Any) -> Tuple[Any, Optional[Dict[str, Any]]]:
+    """Serialize a tool_result content value for an observation payload.
+
+    Image blocks become text markers before json.dumps, so base64 cannot
+    use up the truncation budget or hide the text blocks around it. With
+    capture on, the media follows the truncated text in a list."""
+    if isinstance(raw, str):
+        return truncate_text(raw)
+    media: List[Any] = []
+    if isinstance(raw, list):
+        rendered_blocks: List[Any] = []
+        for block in raw:
+            if isinstance(block, dict) and block.get("type") == "image":
+                media_object = media_from_image_block(block)
+                if media_object is not None:
+                    media.append(media_object)
+                rendered_blocks.append({"type": "text", "text": describe_image_block(block)})
+            else:
+                rendered_blocks.append(block)
+        raw = rendered_blocks
+    text, meta = truncate_text(json.dumps(raw, ensure_ascii=False))
+    if media:
+        return [text, *media], meta
+    return text, meta
+
 def get_tool_result_for_observation(tool_result_entry: Any) -> ToolResultForObservation:
     if not isinstance(tool_result_entry, dict):
         return ToolResultForObservation()
 
-    output_raw = tool_result_entry.get("content")
-    output_str = output_raw if isinstance(output_raw, str) else json.dumps(output_raw, ensure_ascii=False)
-    output, output_meta = truncate_text(output_str)
+    output, output_meta = render_tool_result_content(tool_result_entry.get("content"))
     result_timestamp = parse_timestamp(tool_result_entry.get("timestamp"))
 
     final_output_raw = tool_result_entry.get("final_content")
@@ -1798,12 +1872,7 @@ def get_tool_result_for_observation(tool_result_entry: Any) -> ToolResultForObse
             result_timestamp=result_timestamp,
         )
 
-    final_output_str = (
-        final_output_raw
-        if isinstance(final_output_raw, str)
-        else json.dumps(final_output_raw, ensure_ascii=False)
-    )
-    final_output, _ = truncate_text(final_output_str)
+    final_output, _ = render_tool_result_content(final_output_raw)
     final_result_timestamp = parse_timestamp(tool_result_entry.get("final_timestamp"))
     return ToolResultForObservation(
         output=output,
@@ -2595,8 +2664,12 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
     trace id derived from seed and turn number; otherwise the
     session:user-row-uuid carrier pins the trace id.
     """
-    user_text_raw = extract_text_from_content(get_content_from_row(turn.user_msg))
-    user_text, user_text_meta = truncate_text(user_text_raw)
+    user_content = get_content_from_row(turn.user_msg)
+    user_text, user_text_meta = truncate_text(extract_text_from_content(user_content))
+    # Pasted images attach only to the turn's root input, so each image
+    # uploads once, not once for each LLM call in the turn.
+    user_media = [m for m in (media_from_image_block(b) for b in get_image_blocks(user_content)) if m is not None]
+    turn_input: Any = [user_text, *user_media] if user_media else user_text
     trace_metadata = build_trace_metadata(session_id, turn_num, turn, transcript_path, user_text_meta)
     if parent_context is not None:
         parent_trace_id, parent_span_id = parent_context
@@ -2610,7 +2683,7 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
             forced_trace_id=parent_trace_id,
             forced_parent_span_id=parent_span_id,
             as_root=False,
-            input={"role": "user", "content": user_text},
+            input={"role": "user", "content": turn_input},
             metadata=trace_metadata,
         )
     # Opt-in deterministic trace ids: fail open to the carrier-derived id.
@@ -2628,7 +2701,7 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
         parent_otel_span=None if forced_trace_id else remote_parent(langfuse, session_id, turn.user_msg.get("uuid")),
         forced_trace_id=forced_trace_id,
         as_root=True,
-        input={"role": "user", "content": user_text},
+        input={"role": "user", "content": turn_input},
         metadata=trace_metadata,
     )
 
