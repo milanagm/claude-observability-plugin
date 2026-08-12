@@ -60,8 +60,8 @@
     "CC_LANGFUSE_CAPTURE_IMAGES": {
       "type": "boolean",
       "title": "Capture images",
-      "description": "Upload images to Langfuse and show them in the trace. This includes pasted images and screenshots from tool results. Your Langfuse deployment must support media upload.",
-      "default": false
+      "description": "Upload images to Langfuse and show them in the trace. This includes pasted images and screenshots from tool results. Your Langfuse deployment must support media upload. Set to false to show short text markers instead.",
+      "default": true
     },
     "CC_LANGFUSE_STATE_DIR": {
       "type": "string",

@@ -40,7 +40,8 @@ def test_image_marker_survives_malformed_source(hook_module):
 
 # ---- tool_result serialization ----
 
-def test_tool_result_images_become_markers_and_trailing_text_survives(hook_module):
+def test_tool_result_images_become_markers_and_trailing_text_survives(hook_module, monkeypatch):
+    monkeypatch.setattr(hook_module, "CAPTURE_IMAGES", False)
     big_b64 = "A" * (hook_module.MAX_CHARS * 2)
     result = hook_module.get_tool_result_for_observation(
         {
@@ -115,7 +116,8 @@ def test_tool_result_with_multiple_images_keeps_marker_and_media_order(hook_modu
     ]
 
 
-def test_tool_result_final_content_images_become_markers(hook_module):
+def test_tool_result_final_content_images_become_markers(hook_module, monkeypatch):
+    monkeypatch.setattr(hook_module, "CAPTURE_IMAGES", False)
     result = hook_module.get_tool_result_for_observation(
         {
             "content": "Async agent launched successfully.",
@@ -131,9 +133,10 @@ def test_tool_result_final_content_images_become_markers(hook_module):
 
 # ---- media creation guardrails ----
 
-def test_media_creation_is_off_by_default(hook_module):
-    assert hook_module.CAPTURE_IMAGES is False
-    assert hook_module.media_from_image_block(image_block()) is None
+def test_media_creation_is_on_by_default(hook_module):
+    assert hook_module.CAPTURE_IMAGES is True
+    media = hook_module.media_from_image_block(image_block())
+    assert media is not None and media.content_type == "image/png"
 
 
 def test_media_creation_rejects_non_base64_and_survives_sdk_errors(hook_module, monkeypatch):
@@ -169,6 +172,7 @@ def _config(hook_module):
 
 
 def test_capture_off_disables_sdk_media_auto_upload(hook_module, monkeypatch):
+    monkeypatch.setattr(hook_module, "CAPTURE_IMAGES", False)
     monkeypatch.delenv("LANGFUSE_MEDIA_UPLOAD_ENABLED", raising=False)
 
     try:
@@ -228,7 +232,8 @@ def test_turn_root_input_attaches_media_when_capture_is_on(hook_module, fake_lan
     assert [(m.content_type, m.content_bytes) for m in media] == [("image/png", base64.b64decode(PNG_B64))]
 
 
-def test_turn_root_input_stays_text_when_capture_is_off(hook_module, fake_langfuse, tmp_path):
+def test_turn_root_input_stays_text_when_capture_is_off(hook_module, fake_langfuse, monkeypatch, tmp_path):
+    monkeypatch.setattr(hook_module, "CAPTURE_IMAGES", False)
     turn = hook_module.build_turns(
         [
             {
