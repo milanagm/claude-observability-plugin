@@ -123,6 +123,10 @@ def hook_module() -> Any:
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    # Some tests use module.Langfuse and module.otel_trace_api directly. Thus
+    # the fixture starts the lazy import here. The stub modules are already in
+    # sys.modules, and thus this import is fast.
+    assert module._ensure_langfuse_imported()
     return module
 
 

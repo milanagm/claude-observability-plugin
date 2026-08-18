@@ -9,6 +9,7 @@
 Claude Code -> Langfuse hook
 
 """
+from __future__ import annotations
 
 import base64
 import contextlib
@@ -291,30 +292,49 @@ def info(msg: str) -> None:
             pass
 
 
-# ----------------- Langfuse import (fail-open) -----------------
-# Everything above this guard runs before the SDK import and must stay
-# stdlib-only and parseable on Python 3.9 so this failure path can log.
-try:
-    from langfuse import Langfuse, propagate_attributes
-    from opentelemetry import trace as otel_trace_api
-except Exception as e:
-    info(
-        f"langfuse import failed ({type(e).__name__}: {e}); "
-        f"python={sys.version.split()[0]} executable={sys.executable} "
-        f"PATH={os.environ.get('PATH', '')}. "
-        "Hint: uv was not found on this PATH. If uv is installed, check that its "
-        "location is on the PATH seen by the app that launches Claude Code; "
-        "GUI apps often use a minimal PATH."
-    )
-    sys.exit(0)
+# ----------------- Langfuse import (fail-open, lazy) -----------------
+# The CLI can stop a SessionEnd hook before this import is complete. Usually a
+# SessionEnd run has no work to do, because Stop sent the last turn. Therefore this
+# module starts the import only after main() finds work to do.
+# At import time, this module must use the standard library only. Python 3.9
+# must parse all of this file.
+Langfuse = None
+propagate_attributes = None
+otel_trace_api = None
+LangfuseMedia = None
 
-# If this import fails, image capture falls back to text markers.
-try:
-    from langfuse.media import LangfuseMedia
-except Exception:
-    LangfuseMedia = None
+def _ensure_langfuse_imported() -> bool:
+    global Langfuse, propagate_attributes, otel_trace_api, LangfuseMedia
+    if Langfuse is not None:
+        return True
+    try:
+        from langfuse import Langfuse as _Langfuse, propagate_attributes as _propagate_attributes
+        from opentelemetry import trace as _otel_trace_api
+    except Exception as e:
+        info(
+            f"langfuse import failed ({type(e).__name__}: {e}); "
+            f"python={sys.version.split()[0]} executable={sys.executable} "
+            f"PATH={os.environ.get('PATH', '')}. "
+            "Hint: uv was not found on this PATH. If uv is installed, check that its "
+            "location is on the PATH seen by the app that launches Claude Code; "
+            "GUI apps often use a minimal PATH."
+        )
+        return False
+    Langfuse = _Langfuse
+    propagate_attributes = _propagate_attributes
+    otel_trace_api = _otel_trace_api
+    # Media is optional. When this import fails, image capture falls back to
+    # text markers, and the rest of the run continues.
+    try:
+        from langfuse.media import LangfuseMedia as _LangfuseMedia
+    except Exception:
+        _LangfuseMedia = None
+    LangfuseMedia = _LangfuseMedia
+    return True
 
 def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
+    if not _ensure_langfuse_imported():
+        return None
     # With capture off, stop the SDK from uploading base64 images it finds
     # in span payloads on its own. The SDK reads an empty value as enabled.
     if not CAPTURE_IMAGES and not os.environ.get("LANGFUSE_MEDIA_UPLOAD_ENABLED"):
@@ -550,6 +570,39 @@ def save_hook_state(state: Dict[str, Any]) -> None:
 def save_session_state(global_state: Dict[str, Any], key: str, session_state: SessionState) -> None:
     update_session_state(global_state, key, session_state)
     save_hook_state(global_state)
+
+
+def _has_pending_work(session_id: str, transcript_path: Path) -> bool:
+    """Return true when this run has work to do."""
+    try:
+        offset = 0
+        pending = True
+        state = load_hook_state()
+        key = get_session_state_key(session_id, str(transcript_path))
+        entry = state.get(key)
+        if isinstance(entry, dict):
+            offset = int(entry.get("offset", 0))
+            # An open turn is also work to do. SessionEnd must complete that
+            # turn, and a later Stop can find that the background activity of
+            # the turn is complete.
+            pending = (
+                bool(entry.get("pending_agent_turns"))
+                or bool(entry.get("pending_task_notifications"))
+                or bool(entry.get("open_turn"))
+            )
+            # A skipped run does not write the state file, but save_hook_state
+            # drops entries that got no write for 30 days. When the timestamp
+            # of the entry is old, this run must use the normal path. The
+            # normal path writes the entry again and makes it new.
+            updated = entry.get("updated")
+            if not pending and isinstance(updated, str):
+                ts = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                if datetime.now(timezone.utc) - ts > timedelta(days=7):
+                    return True
+        file_size = transcript_path.stat().st_size if transcript_path.exists() else 0
+        return pending or file_size != offset
+    except Exception:
+        return True
 
 
 # ----------------- Transcript row parsing -----------------
@@ -2696,7 +2749,6 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
     )
 
 
-
 def build_turn_output_payload(turn: Turn) -> Dict[str, Any]:
     last_assistant = turn.assistant_msgs[-1]
     text, _ = truncate_text(extract_text_from_content(get_content_from_row(last_assistant)))
@@ -3030,6 +3082,10 @@ def main() -> int:
 
     session_id, transcript_path = hook_context
     flush_deferred_agent_turns = is_session_end_hook_payload(payload)
+
+    if not _has_pending_work(session_id, transcript_path):
+        debug("Nothing new to emit, skipping langfuse import")
+        return 0
 
     langfuse = create_langfuse_client(config)
     if langfuse is None:
