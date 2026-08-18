@@ -237,6 +237,10 @@ def _isolated_hook_env(tmp_path: Path, hook_module: Any, monkeypatch: pytest.Mon
     monkeypatch.setattr(hook_module, "STATE_FILE", state_dir / "langfuse_state.json")
     monkeypatch.setattr(hook_module, "LOCK_FILE", state_dir / "langfuse_state.lock")
     monkeypatch.setattr(hook_module, "LOG_FILE", state_dir / "langfuse_hook.log")
+    # A SessionEnd run forks. A fork of the pytest process runs the rest of the
+    # suite two times, and thus every test keeps the foreground by default. The
+    # tests for the fork set this option back.
+    monkeypatch.setattr(hook_module, "SYNC_SESSION_END", True)
     _reset_hook_logger(hook_module)
     yield state_dir
     _reset_hook_logger(hook_module)

@@ -41,6 +41,8 @@ DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
 CAPTURE_IMAGES = (_opt("CC_LANGFUSE_CAPTURE_IMAGES") or "true").lower() == "true"
+# Keep a SessionEnd run in the foreground; see _detach_from_cli.
+SYNC_SESSION_END = _opt("CC_LANGFUSE_SYNC_SESSION_END").lower() == "true"
 try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
 except ValueError:
@@ -3063,6 +3065,40 @@ def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> None:
 
 
 # ----------------- Main -----------------
+def _detach_from_cli() -> bool:
+    """Move this run into a child process. Return true in the parent process.
+
+    The CLI stops a SessionEnd hook about 1.5 seconds after the exit, and a
+    SessionEnd run with work to do needs more time. The parent gives control
+    back to the CLI at once, and the child completes the upload.
+    """
+    if SYNC_SESSION_END or not hasattr(os, "fork"):
+        return False
+    try:
+        if os.fork() > 0:
+            return True
+    except OSError as e:
+        info(f"SessionEnd fork failed ({type(e).__name__}: {e}); this run stays in the foreground")
+        return False
+    # The child must leave the process group of the CLI, because the CLI can
+    # signal the whole group at the exit. It must also close the pipes of the
+    # CLI, because a write to a closed pipe stops the child. The log file is
+    # the only output channel that stays.
+    try:
+        os.setsid()
+    except OSError:
+        pass
+    try:
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
+        if devnull > 2:
+            os.close(devnull)
+    except OSError:
+        pass
+    return False
+
+
 def main() -> int:
     start = time.time()
     debug("Hook started")
@@ -3085,6 +3121,12 @@ def main() -> int:
 
     if not _has_pending_work(session_id, transcript_path):
         debug("Nothing new to emit, skipping langfuse import")
+        return 0
+
+    # Only SessionEnd meets the shutdown deadline of the CLI. A Stop run keeps
+    # the foreground, because the CLI waits for it and shows its errors.
+    if flush_deferred_agent_turns and _detach_from_cli():
+        debug("SessionEnd has work to do; a child process completes it")
         return 0
 
     langfuse = create_langfuse_client(config)
