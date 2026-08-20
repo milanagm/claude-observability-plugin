@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#   "langfuse>=4.0,<5",
+#   "langfuse>=4.7,<5",
 # ]
 # ///
 """
@@ -1663,7 +1663,7 @@ def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
         raise RuntimeError(
             f"Langfuse SDK {sdk_version} is missing _otel_tracer or "
             f"_create_observation_from_otel_span. This hook targets SDK 4.x; "
-            f"pin with `pip install \"langfuse>=4.0,<5\"` or update the hook script."
+            f"pin with `pip install \"langfuse>=4.7,<5\"` or update the hook script."
         )
     start_ns = to_otel_nanoseconds(start_time)
     if parent_otel_span is not None:
