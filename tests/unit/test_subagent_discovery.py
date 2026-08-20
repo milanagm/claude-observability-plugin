@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 
 
@@ -36,10 +37,9 @@ def test_discovers_nested_subagent_metadata_seen_in_real_claude_code_transcripts
 def test_discovers_workflow_agent_transcripts_by_run_id(hook_module, fixture_transcript_path):
     transcript = fixture_transcript_path("workflow_subagents")
 
-    workflows = hook_module.get_workflow_agent_transcripts_by_run_id(transcript)
+    lookup = hook_module.WorkflowAgentTranscriptsByRunId(transcript)
 
-    assert set(workflows) == {"wf_test001"}
-    agents = workflows["wf_test001"]
+    agents = lookup.get("wf_test001")
     # The journal also holds a started-row for "r3" with no result and no
     # meta/jsonl on disk (real partial-journal case: agent still running or
     # torn down early) — discovery is meta-driven, so r3 never surfaces.
@@ -51,12 +51,109 @@ def test_discovers_workflow_agent_transcripts_by_run_id(hook_module, fixture_tra
     assert agents[1]["result"] == {"verdict": "claim B holds", "confidence": "high"}
 
 
+def test_workflow_lookup_keeps_concurrent_runs_apart(hook_module, tmp_path):
+    # One firing can emit turns that use more than one run, so each run keeps
+    # its own entry.
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    workflows_dir = tmp_path / "transcript" / "subagents" / "workflows"
+    for run_id, agent_id in (("wf_first", "f1"), ("wf_second", "s1")):
+        run_dir = workflows_dir / run_id
+        run_dir.mkdir(parents=True)
+        (run_dir / f"agent-{agent_id}.meta.json").write_text(
+            json.dumps({"agentType": "workflow-subagent", "spawnDepth": 1}), encoding="utf-8"
+        )
+        (run_dir / f"agent-{agent_id}.jsonl").write_text("", encoding="utf-8")
+        (run_dir / "journal.jsonl").write_text(
+            json.dumps({"type": "result", "key": "v2:abc", "agentId": agent_id,
+                        "result": {"run": run_id}}) + "\n",
+            encoding="utf-8",
+        )
+    lookup = hook_module.WorkflowAgentTranscriptsByRunId(transcript)
+
+    first = lookup.get("wf_first")
+    second = lookup.get("wf_second")
+
+    assert [agent["agent_id"] for agent in first] == ["f1"]
+    assert [agent["agent_id"] for agent in second] == ["s1"]
+    assert first[0]["result"] == {"run": "wf_first"}
+    assert second[0]["result"] == {"run": "wf_second"}
+    # A second lookup of each run gives the agents of that run.
+    assert lookup.get("wf_first") is first
+    assert lookup.get("wf_second") is second
+
+
+def test_workflow_lookup_finds_a_run_directory_without_the_wf_prefix(hook_module, tmp_path):
+    # The run id names the directory, so a name without the earlier "wf_" glob
+    # pattern resolves too. This is wider on purpose.
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    run_dir = tmp_path / "transcript" / "subagents" / "workflows" / "run_abc"
+    run_dir.mkdir(parents=True)
+    (run_dir / "agent-n1.meta.json").write_text(
+        json.dumps({"agentType": "workflow-subagent", "spawnDepth": 1}), encoding="utf-8"
+    )
+    (run_dir / "agent-n1.jsonl").write_text("", encoding="utf-8")
+
+    agents = hook_module.WorkflowAgentTranscriptsByRunId(transcript).get("run_abc")
+
+    assert [agent["agent_id"] for agent in agents] == ["n1"]
+
+
+def test_workflow_lookup_memoizes_run_ids_that_have_no_agents(
+    hook_module,
+    tmp_path,
+    monkeypatch,
+):
+    # A run directory can be absent. The lookup must keep that empty result too,
+    # or each observation that uses the run makes a new read.
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    scanned: list[str] = []
+    monkeypatch.setattr(
+        hook_module,
+        "get_workflow_agents_in_run_dir",
+        lambda run_dir: scanned.append(run_dir.name) or [],
+    )
+    lookup = hook_module.WorkflowAgentTranscriptsByRunId(transcript)
+
+    assert lookup.get("wf_gone") is None
+    assert lookup.get("wf_gone") is None
+    assert scanned == ["wf_gone"]
+
+
+def test_workflow_lookup_rejects_run_ids_that_leave_the_workflows_directory(
+    hook_module,
+    fixture_transcript_path,
+    monkeypatch,
+):
+    # The lookup makes a path from transcript data, so only a plain directory
+    # name must resolve, and a rejected run id must cause no read.
+    transcript = fixture_transcript_path("workflow_subagents")
+    scanned: list[str] = []
+    monkeypatch.setattr(
+        hook_module,
+        "get_workflow_agents_in_run_dir",
+        lambda run_dir: scanned.append(str(run_dir)) or [],
+    )
+    lookup = hook_module.WorkflowAgentTranscriptsByRunId(transcript)
+
+    for hostile_run_id in ("..", "../wf_test001", "wf_test001/..", "nested/wf_test001",
+                           "/etc", ".", "wf_test001/"):
+        assert lookup.get(hostile_run_id) is None, hostile_run_id
+    # An absent or incorrect run id also gives None, and makes no file read.
+    assert lookup.get(None) is None
+    assert lookup.get("") is None
+    assert lookup.get(123) is None
+    assert scanned == []
+
+
 def test_workflow_agents_stay_invisible_to_classic_subagent_discovery(
     hook_module,
     fixture_transcript_path,
 ):
     # Documented split: the classic function keys strictly by toolUseId and
-    # stays non-recursive; workflow agents are only reachable via the new map.
+    # stays non-recursive. Only the run-id lookup finds workflow agents.
     transcript = fixture_transcript_path("workflow_subagents")
 
     assert hook_module.get_subagent_transcripts_by_tool_use_id(transcript) == {}
@@ -78,7 +175,7 @@ def test_workflow_discovery_ignores_bad_or_foreign_metadata(hook_module, tmp_pat
         encoding="utf-8",
     )
 
-    assert hook_module.get_workflow_agent_transcripts_by_run_id(transcript) == {}
+    assert hook_module.WorkflowAgentTranscriptsByRunId(transcript).get("wf_x1") is None
 
 
 def test_workflow_discovery_drops_run_dirs_with_journal_but_no_agents(hook_module, tmp_path):
@@ -94,7 +191,7 @@ def test_workflow_discovery_drops_run_dirs_with_journal_but_no_agents(hook_modul
         encoding="utf-8",
     )
 
-    assert hook_module.get_workflow_agent_transcripts_by_run_id(transcript) == {}
+    assert hook_module.WorkflowAgentTranscriptsByRunId(transcript).get("wf_journal_only") is None
 
 
 def test_workflow_discovery_ignores_orphan_agent_jsonl_without_meta(hook_module, tmp_path):
@@ -110,7 +207,7 @@ def test_workflow_discovery_ignores_orphan_agent_jsonl_without_meta(hook_module,
         encoding="utf-8",
     )
 
-    assert hook_module.get_workflow_agent_transcripts_by_run_id(transcript) == {}
+    assert hook_module.WorkflowAgentTranscriptsByRunId(transcript).get("wf_orphan") is None
 
 
 def test_workflow_discovery_accepts_metas_with_extra_real_world_keys(hook_module, tmp_path):
@@ -135,11 +232,10 @@ def test_workflow_discovery_accepts_metas_with_extra_real_world_keys(hook_module
     )
     (run_dir / "agent-a1.jsonl").write_text("", encoding="utf-8")
 
-    workflows = hook_module.get_workflow_agent_transcripts_by_run_id(transcript)
+    agents = hook_module.WorkflowAgentTranscriptsByRunId(transcript).get("wf_x3")
 
-    assert set(workflows) == {"wf_x3"}
-    assert workflows["wf_x3"][0]["agent_id"] == "a1"
-    assert workflows["wf_x3"][0]["agent_type"] == "workflow-subagent"
+    assert [agent["agent_id"] for agent in agents] == ["a1"]
+    assert agents[0]["agent_type"] == "workflow-subagent"
 
 
 def test_workflow_discovery_without_journal_leaves_results_empty(hook_module, tmp_path):
@@ -153,11 +249,28 @@ def test_workflow_discovery_without_journal_leaves_results_empty(hook_module, tm
     )
     (run_dir / "agent-a1.jsonl").write_text("", encoding="utf-8")
 
-    workflows = hook_module.get_workflow_agent_transcripts_by_run_id(transcript)
+    agents = hook_module.WorkflowAgentTranscriptsByRunId(transcript).get("wf_x2")
 
-    assert set(workflows) == {"wf_x2"}
-    assert workflows["wf_x2"][0]["agent_id"] == "a1"
-    assert workflows["wf_x2"][0]["result"] is None
+    assert [agent["agent_id"] for agent in agents] == ["a1"]
+    assert agents[0]["result"] is None
+
+
+def test_workflow_lookup_survives_a_run_directory_the_filesystem_rejects(
+    hook_module,
+    tmp_path,
+    monkeypatch,
+):
+    # The hook runs in the Stop path of Claude Code. Thus a run path that the
+    # operating system refuses must not stop the turn.
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("", encoding="utf-8")
+
+    def raise_name_too_long(_run_dir):
+        raise OSError(errno.ENAMETOOLONG, "File name too long")
+
+    monkeypatch.setattr(hook_module, "get_workflow_agents_in_run_dir", raise_name_too_long)
+
+    assert hook_module.WorkflowAgentTranscriptsByRunId(transcript).get("wf_x") is None
 
 
 def test_ignores_bad_or_incomplete_subagent_metadata(hook_module, tmp_path):

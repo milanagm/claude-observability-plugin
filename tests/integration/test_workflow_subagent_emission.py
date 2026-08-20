@@ -31,6 +31,45 @@ def ts_ns(hook_module: Any, iso_timestamp: str) -> int:
     return hook_module.to_otel_nanoseconds(hook_module.parse_timestamp(iso_timestamp))
 
 
+def record_scanned_run_dirs(hook_module: Any, monkeypatch: Any) -> list[str]:
+    """Record the run directories that an emission reads from disk.
+
+    The returned list stays live. Clear it between firings to limit an assertion
+    to one firing."""
+    scanned: list[str] = []
+    real_scan = hook_module.get_workflow_agents_in_run_dir
+
+    def recording_scan(run_dir: Path) -> Any:
+        scanned.append(run_dir.name)
+        return real_scan(run_dir)
+
+    monkeypatch.setattr(hook_module, "get_workflow_agents_in_run_dir", recording_scan)
+    return scanned
+
+
+def plain_turn_rows(index: int, minute: int) -> list[dict[str, Any]]:
+    """An ordinary turn of two rows. The session continues after a workflow."""
+    return [
+        {"type": "user", "timestamp": f"2026-07-23T10:{minute:02d}:00.000Z",
+         "sessionId": "session-workflow", "uuid": f"user-plain-{index}", "cwd": "/repo",
+         "gitBranch": "main", "origin": {"kind": "human"}, "parentUuid": None,
+         "permissionMode": "default", "promptId": f"prompt-plain-{index}",
+         "promptSource": "sdk", "entrypoint": "cli", "userType": "external",
+         "version": "2.1.215", "isSidechain": False,
+         "message": {"role": "user", "content": f"Plain question {index}?"}},
+        {"type": "assistant", "timestamp": f"2026-07-23T10:{minute:02d}:20.000Z",
+         "sessionId": "session-workflow", "uuid": f"assistant-plain-{index}",
+         "parentUuid": f"user-plain-{index}", "requestId": f"req-plain-{index}",
+         "entrypoint": "cli", "userType": "external", "version": "2.1.215",
+         "isSidechain": False,
+         "message": {"id": f"msg-plain-{index}", "type": "message", "role": "assistant",
+                     "model": "claude-test",
+                     "content": [{"type": "text", "text": f"Plain answer {index}."}],
+                     "stop_reason": "end_turn",
+                     "usage": {"input_tokens": 5, "output_tokens": 5}}},
+    ]
+
+
 # The last workflow-agent activity on disk (r2's trailing StructuredOutput
 # tool_result row): the only timestamp that can reach the tool/root span ends
 # via workflow_end_timestamp.
@@ -430,3 +469,124 @@ def test_workflow_launch_without_workflow_name_falls_back_to_run_id_labels(
     agent_spans = [o for o in fake_langfuse.observations if o.name.startswith("Workflow agent: ")]
     assert all(o._otel_span.parent is tool_span._otel_span for o in agent_spans)
     assert all("workflow_name" not in o.kwargs["metadata"] for o in agent_spans)
+
+
+def test_only_the_run_directory_the_turn_references_is_read(
+    hook_module,
+    fake_langfuse,
+    isolated_hook_state,
+    fixture_transcript_path,
+    tmp_path,
+    monkeypatch,
+):
+
+    transcript, rows = copy_workflow_fixture(fixture_transcript_path, tmp_path)
+    other_run_dir = tmp_path / "transcript" / "subagents" / "workflows" / "wf_test002"
+    other_run_dir.mkdir(parents=True)
+    (other_run_dir / "agent-x9.meta.json").write_text(
+        json.dumps({"agentType": "workflow-subagent", "spawnDepth": 1}), encoding="utf-8"
+    )
+    (other_run_dir / "agent-x9.jsonl").write_text("", encoding="utf-8")
+    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
+    scanned = record_scanned_run_dirs(hook_module, monkeypatch)
+
+    append_rows(transcript, rows)
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, "session-workflow-scope", transcript)
+
+    assert scanned == ["wf_test001"]
+
+
+def test_closed_workflow_turn_is_not_reread_by_later_firings(
+    hook_module,
+    fake_langfuse,
+    isolated_hook_state,
+    fixture_transcript_path,
+    tmp_path,
+    monkeypatch,
+):
+    transcript, rows = copy_workflow_fixture(fixture_transcript_path, tmp_path)
+    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
+    scanned = record_scanned_run_dirs(hook_module, monkeypatch)
+
+    # Firing 1 resolves the workflow turn and emits its agents. This reads the
+    # run directory.
+    append_rows(transcript, rows)
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, "session-workflow-closed", transcript)
+    assert scanned == ["wf_test001"]
+    assert len([o for o in fake_langfuse.observations if o.name.startswith("Workflow agent: ")]) == 2
+
+    # The workflow turn is still the open turn. The next turn completes it, and
+    # that close walks its rows once more and reads the run again.
+    scanned.clear()
+    append_rows(transcript, plain_turn_rows(1, 5))
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, "session-workflow-closed", transcript)
+    assert scanned == ["wf_test001"]
+
+    # A closed turn never enters emission again, so its run directory, whose
+    # journal holds every agent's return value, is not read again.
+    scanned.clear()
+    for index, minute in ((2, 6), (3, 7), (4, 8)):
+        append_rows(transcript, plain_turn_rows(index, minute))
+        hook_module.emit_new_turns_from_transcript(
+            fake_langfuse, config, "session-workflow-closed", transcript
+        )
+
+    assert scanned == []
+    # No turn is a duplicate, and no turn is lost. The workflow turn and the
+    # four ordinary turns each reach Langfuse one time.
+    assert len([o for o in fake_langfuse.observations if o.name.startswith("Workflow agent: ")]) == 2
+    assert [o.name for o in fake_langfuse.observations].count("Conversational Turn") == 5
+
+
+def test_held_workflow_turn_defers_the_run_directory_read_too(
+    hook_module,
+    fake_langfuse,
+    isolated_hook_state,
+    fixture_transcript_path,
+    tmp_path,
+    monkeypatch,
+):
+    transcript, rows = copy_workflow_fixture(fixture_transcript_path, tmp_path)
+    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
+    scanned = record_scanned_run_dirs(hook_module, monkeypatch)
+
+    append_rows(transcript, rows[:4])
+    for _ in range(3):
+        hook_module.emit_new_turns_from_transcript(
+            fake_langfuse, config, "session-workflow-held", transcript
+        )
+    assert fake_langfuse.observations == []
+    assert scanned == []
+
+    # An agent that comes to disk after those firings is still found. The lookup
+    # keeps a result for one firing only.
+    run_dir = tmp_path / "transcript" / "subagents" / "workflows" / "wf_test001"
+    (run_dir / "agent-r3.meta.json").write_text(
+        json.dumps({"agentType": "workflow-subagent", "spawnDepth": 1}), encoding="utf-8"
+    )
+    append_rows(run_dir / "agent-r3.jsonl", [
+        {"type": "user", "timestamp": "2026-07-23T10:01:00.000Z", "sessionId": "session-workflow",
+         "agentId": "r3", "uuid": "wf-r3-user-1", "parentUuid": None, "isSidechain": True,
+         "message": {"role": "user", "content": "Verify claim C."}},
+        {"type": "assistant", "timestamp": "2026-07-23T10:01:30.000Z", "sessionId": "session-workflow",
+         "agentId": "r3", "uuid": "wf-r3-assistant-1", "parentUuid": "wf-r3-user-1",
+         "isSidechain": True,
+         "message": {"id": "msg-wf-r3-1", "type": "message", "role": "assistant",
+                     "model": "claude-test",
+                     "content": [{"type": "text", "text": "Claim C holds."}],
+                     "stop_reason": "end_turn",
+                     "usage": {"input_tokens": 2, "output_tokens": 60}}},
+    ])
+
+    append_rows(transcript, rows[4:])
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, "session-workflow-held", transcript)
+
+    assert scanned == ["wf_test001"]
+    agent_spans = sorted(
+        o.name for o in fake_langfuse.observations if o.name.startswith("Workflow agent: ")
+    )
+    assert agent_spans == [
+        "Workflow agent: verify-claims/r1",
+        "Workflow agent: verify-claims/r2",
+        "Workflow agent: verify-claims/r3",
+    ]
