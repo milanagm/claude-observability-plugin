@@ -1437,48 +1437,76 @@ def get_workflow_journal_results(run_dir: Path) -> Dict[str, Any]:
             results_by_agent_id[agent_id] = journal_row.get("result")
     return results_by_agent_id
 
-def get_workflow_agent_transcripts_by_run_id(transcript_path: Path) -> Dict[str, List[Dict[str, Any]]]:
-    """Map Workflow run ids to the workflow-spawned agent transcripts on disk.
+def get_workflow_agents_in_run_dir(run_dir: Path) -> List[Dict[str, Any]]:
+    """The workflow-spawned agent transcripts of one Workflow run directory.
 
-    Workflow-tool agents live under <stem>/subagents/workflows/wf_<runId>/;
+    Workflow-tool agents live under <stem>/subagents/workflows/<runId>/;
     their meta.json carries agentType=="workflow-subagent" and — unlike
-    classic subagents — no toolUseId, so they are keyed by the run id (the
-    directory name) instead. The launching tool_use is linked via
-    toolUseResult.runId on the parent transcript's tool_result row
-    (see get_workflow_launch_marker_from_row).
+    classic subagents — no toolUseId, so a run is identified by its directory
+    name instead. The launching tool_use is linked via toolUseResult.runId on
+    the parent transcript's tool_result row (see
+    get_workflow_launch_marker_from_row).
     """
-    workflows_dir = transcript_path.with_suffix("") / "subagents" / "workflows"
-    if not workflows_dir.is_dir():
-        return {}
+    if not run_dir.is_dir():
+        return []
 
-    workflow_agents_by_run_id: Dict[str, List[Dict[str, Any]]] = {}
-    for run_dir in sorted(workflows_dir.glob("wf_*")):
-        if not run_dir.is_dir():
+    journal_results = get_workflow_journal_results(run_dir)
+    agents: List[Dict[str, Any]] = []
+    for meta_path in sorted(run_dir.glob("agent-*.meta.json")):
+        try:
+            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
             continue
-        journal_results = get_workflow_journal_results(run_dir)
-        agents: List[Dict[str, Any]] = []
-        for meta_path in sorted(run_dir.glob("agent-*.meta.json")):
+        if not isinstance(metadata, dict) or metadata.get("agentType") != "workflow-subagent":
+            continue
+
+        resolved = resolve_agent_jsonl_and_id(meta_path)
+        if resolved is None:
+            continue
+        jsonl_path, agent_id = resolved
+
+        agents.append({
+            "path": jsonl_path,
+            "agent_id": agent_id,
+            "agent_type": metadata.get("agentType"),
+            "result": journal_results.get(agent_id),
+        })
+    return agents
+
+
+class WorkflowAgentTranscriptsByRunId:
+    """Per-run lookup of workflow-spawned agent transcripts. It reads on demand.
+
+    The first lookup of a run id reads that run directory. The lookup then keeps
+    the result for its own life, which is one hook firing. Thus only a firing
+    that emits a reference to a run reads that run, and it always reads the
+    current files."""
+
+    def __init__(self, transcript_path: Path) -> None:
+        self._workflows_dir = transcript_path.with_suffix("") / "subagents" / "workflows"
+        self._agents_by_run_id: Dict[str, List[Dict[str, Any]]] = {}
+
+    def get(self, run_id: Optional[str]) -> Optional[List[Dict[str, Any]]]:
+        if not isinstance(run_id, str) or not run_id:
+            return None
+        # A run id comes from transcript data, and this method makes a path from
+        # it. Thus the method must accept only a single plain directory name.
+        # The name test rejects each other shape, but not "..", whose Path.name
+        # is ".." again.
+        if run_id == ".." or run_id != Path(run_id).name:
+            return None
+        if run_id not in self._agents_by_run_id:
             try:
-                metadata = json.loads(meta_path.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            if not isinstance(metadata, dict) or metadata.get("agentType") != "workflow-subagent":
-                continue
-
-            resolved = resolve_agent_jsonl_and_id(meta_path)
-            if resolved is None:
-                continue
-            jsonl_path, agent_id = resolved
-
-            agents.append({
-                "path": jsonl_path,
-                "agent_id": agent_id,
-                "agent_type": metadata.get("agentType"),
-                "result": journal_results.get(agent_id),
-            })
-        if agents:
-            workflow_agents_by_run_id[run_dir.name] = agents
-    return workflow_agents_by_run_id
+                agents = get_workflow_agents_in_run_dir(self._workflows_dir / run_id)
+            except OSError as e:
+                # The file system can refuse a run path, for example when the
+                # name is too long. Such a failure must not stop the turn.
+                debug(f"Workflow run {run_id} not readable: {e}")
+                agents = []
+            if agents:
+                debug(f"Discovered {len(agents)} workflow agent transcript(s) for run {run_id}")
+            self._agents_by_run_id[run_id] = agents
+        return self._agents_by_run_id[run_id] or None
 
 def get_task_id_to_tool_use_id(
     subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]],
@@ -1877,7 +1905,7 @@ def emit_single_tool_observation(
     pending_async_tool_results: List[Dict[str, Any]],
     cursor: EmissionCursor,
     tool_key: str,
-    workflow_agent_transcripts_by_run_id: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    workflow_agent_transcripts_by_run_id: Optional[WorkflowAgentTranscriptsByRunId] = None,
 ) -> EmittedSingleToolObservation:
     tool_use_id = str(tool_use.get("id") or "")
     tool_name = tool_use.get("name") or "unknown"
@@ -2031,7 +2059,7 @@ def emit_tool_observation_batch(
     pending_subagents: List[Dict[str, Any]],
     pending_async_tool_results: List[Dict[str, Any]],
     cursor: EmissionCursor,
-    workflow_agent_transcripts_by_run_id: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    workflow_agent_transcripts_by_run_id: Optional[WorkflowAgentTranscriptsByRunId] = None,
 ) -> EmittedToolObservationBatch:
     assistant_timestamp = parse_timestamp(assistant_message)
     generation_key = generation_emission_key(assistant_index, assistant_message)
@@ -2188,7 +2216,7 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
                            generation_name: str = "LLM Call",
                            subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
                            cursor: Optional[EmissionCursor] = None,
-                           workflow_agent_transcripts_by_run_id: Optional[Dict[str, List[Dict[str, Any]]]] = None) -> Optional[datetime]:
+                           workflow_agent_transcripts_by_run_id: Optional[WorkflowAgentTranscriptsByRunId] = None) -> Optional[datetime]:
     """Emit a turn's generations and tool observations under an existing span.
 
     The full turn is always walked so cross-observation context (generation
@@ -2647,7 +2675,7 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
               close: bool = True,
               trace_seed: Optional[str] = None,
               parent_context: Optional[Tuple[str, str]] = None,
-              workflow_agent_transcripts_by_run_id: Optional[Dict[str, List[Dict[str, Any]]]] = None) -> Dict[str, Any]:
+              workflow_agent_transcripts_by_run_id: Optional[WorkflowAgentTranscriptsByRunId] = None) -> Dict[str, Any]:
     """Emit a turn, resuming from prior firings' progress.
 
     With no progress and close=True this is the classic one-shot emission.
@@ -2738,7 +2766,7 @@ def emit_and_close_ready_turns(
     subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]],
     trace_seed: Optional[str] = None,
     parent_context: Optional[Tuple[str, str]] = None,
-    workflow_agent_transcripts_by_run_id: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    workflow_agent_transcripts_by_run_id: Optional[WorkflowAgentTranscriptsByRunId] = None,
 ) -> int:
     emitted = 0
     # Turns without a user-row uuid bypass assign_turn_numbers; seed their
@@ -2789,7 +2817,7 @@ def emit_ready_observations_of_open_turn(
     subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]],
     trace_seed: Optional[str] = None,
     parent_context: Optional[Tuple[str, str]] = None,
-    workflow_agent_transcripts_by_run_id: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    workflow_agent_transcripts_by_run_id: Optional[WorkflowAgentTranscriptsByRunId] = None,
 ) -> None:
     """Emit the held open turn once its async activity is provably resolved.
 
@@ -2856,12 +2884,7 @@ def emit_new_turns_from_transcript(
         if subagent_transcripts_by_tool_use_id:
             debug(f"Discovered {len(subagent_transcripts_by_tool_use_id)} subagent transcript(s)")
 
-        workflow_agent_transcripts_by_run_id = get_workflow_agent_transcripts_by_run_id(transcript_path)
-        if workflow_agent_transcripts_by_run_id:
-            debug(
-                f"Discovered workflow agent transcript(s) for "
-                f"{len(workflow_agent_transcripts_by_run_id)} workflow run(s)"
-            )
+        workflow_agent_transcripts_by_run_id = WorkflowAgentTranscriptsByRunId(transcript_path)
 
         turns, session_state = get_new_turns_from_transcript(
             transcript_path,
