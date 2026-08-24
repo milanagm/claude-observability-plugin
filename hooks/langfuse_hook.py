@@ -971,7 +971,10 @@ def get_async_launch_flag_from_row(row: Dict[str, Any]) -> Optional[bool]:
     tool_use_result = row.get("toolUseResult")
     if not isinstance(tool_use_result, dict):
         return None
-    return tool_use_result.get("status") == "async_launched" or tool_use_result.get("isAsync") is True
+    # A teammate launch is async too: its result never carries the final output.
+    if tool_use_result.get("status") in ("async_launched", "teammate_spawned"):
+        return True
+    return tool_use_result.get("isAsync") is True
 
 def get_workflow_launch_marker_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Read the structured Workflow launch marker from a tool_result row.
@@ -1432,27 +1435,77 @@ def resolve_agent_jsonl_and_id(meta_path: Path) -> Optional[Tuple[Path, str]]:
         agent_id = agent_id[len("agent-"):]
     return jsonl_path, agent_id
 
+def get_agent_launch_tool_use_ids_by_name(transcript_path: Path) -> Dict[str, str]:
+    """Map each agent name to the tool_use id of its launch.
+    The function streams the full transcript. It removes ambiguous names."""
+    mapping: Dict[str, str] = {}
+    ambiguous: set = set()
+    try:
+        with transcript_path.open(encoding="utf-8") as lines:
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                for tool_use in get_tool_use_blocks(get_content_from_row(row)):
+                    tool_use_id = str(tool_use.get("id") or "")
+                    tool_input = tool_use.get("input")
+                    if tool_use.get("name") not in ("Agent", "Task") or not tool_use_id:
+                        continue
+                    name = tool_input.get("name") if isinstance(tool_input, dict) else None
+                    if not isinstance(name, str) or not name:
+                        continue
+                    if mapping.get(name, tool_use_id) != tool_use_id:
+                        ambiguous.add(name)
+                    mapping[name] = tool_use_id
+    except Exception:
+        return {}
+    return {name: tool_use_id for name, tool_use_id in mapping.items() if name not in ambiguous}
+
 def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, Dict[str, Any]]:
     """Map launching Agent/Task tool_use ids to their subagent transcripts."""
     subagent_dir = transcript_path.with_suffix("") / "subagents"
     if not subagent_dir.is_dir():
         return {}
 
+    # Build the fallback map only when a meta has no toolUseId.
+    fallback_tool_use_ids: Optional[Dict[str, str]] = None
+    claimed_twice: set = set()
     subagent_transcripts_by_tool_use_id: Dict[str, Dict[str, Any]] = {}
-    for meta_path in subagent_dir.glob("*.meta.json"):
+    for meta_path in sorted(subagent_dir.glob("*.meta.json")):
         try:
             metadata = json.loads(meta_path.read_text(encoding="utf-8"))
         except Exception:
             continue
-
-        tool_use_id = metadata.get("toolUseId")
-        if not isinstance(tool_use_id, str) or not tool_use_id:
+        if not isinstance(metadata, dict):
             continue
 
         resolved = resolve_agent_jsonl_and_id(meta_path)
         if resolved is None:
             continue
         jsonl_path, agent_id = resolved
+
+        tool_use_id = metadata.get("toolUseId")
+        if not isinstance(tool_use_id, str) or not tool_use_id:
+            if fallback_tool_use_ids is None:
+                fallback_tool_use_ids = get_agent_launch_tool_use_ids_by_name(transcript_path)
+            # A teammate meta carries the launch input.name.
+            name = metadata.get("name")
+            tool_use_id = fallback_tool_use_ids.get(name) if isinstance(name, str) else None
+        if not tool_use_id:
+            info(f"subagent transcript not attributable to a launching tool_use, skipping: {meta_path}")
+            continue
+        if tool_use_id in claimed_twice or tool_use_id in subagent_transcripts_by_tool_use_id:
+            # Two metas claim one launch -> Drop both.
+            claimed_twice.add(tool_use_id)
+            subagent_transcripts_by_tool_use_id.pop(tool_use_id, None)
+            info(f"multiple subagent metas claim tool_use {tool_use_id}, skipping: {meta_path}")
+            continue
 
         subagent_transcripts_by_tool_use_id[tool_use_id] = {
             "path": jsonl_path,
