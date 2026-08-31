@@ -1,6 +1,51 @@
 # Langfuse Observability Plugin for Claude Code
 
-Trace hook-backed Claude Code sessions to [Langfuse](https://langfuse.com) — turns, generations, tool calls, and token usage — with zero code changes.
+This plugin sends [Claude Code](https://claude.com/claude-code) sessions to
+[Langfuse](https://langfuse.com). It records the user prompts, the agent turns,
+the model generations with their tokens and cost, and the tool calls, with no
+change to your code.
+
+Langfuse also documents this integration on the
+[Claude Code integration page](https://langfuse.com/integrations/developer-tools/claude-code).
+
+## What can this integration trace?
+
+The plugin runs as a Claude Code hook and reads the session transcript on every
+turn, so tracing needs no change to the way you work:
+
+- **Agent turns**: one trace per user prompt, with all turns of a session grouped
+  under one session ID.
+- **Model generations**: every assistant message with inputs, outputs, cost and
+  token usage, including cache-read and reasoning splits.
+- **Tool calls**: each tool Claude Code invokes, with input and output.
+- **Subagents**: subagent and Workflow-spawned agent transcripts nest under the
+  turn that started them.
+- **Skills**: traces carry a `skill:<name>` tag for every skill a turn invokes.
+- **Images**: pasted images and screenshots from tool results upload as Langfuse
+  media and render inside the trace.
+
+Tracing covers the `claude` CLI and desktop **Code** mode; regular Claude Desktop
+**Chat** mode runs no Claude Code hooks and is not traced. 
+
+## Prerequisites
+
+One of:
+
+- [uv](https://docs.astral.sh/uv/) (recommended) on `PATH`. The hook uses
+  `uv run --script` and installs the Langfuse SDK from the script metadata.
+- Python 3.10+ as `python3` with `langfuse>=4.7,<5` installed. This is only a
+  fallback for when `uv` is not on `PATH`.
+
+On the first hook run, uv downloads the SDK from PyPI and caches it. An offline
+or proxied machine retries that download every turn until the cache is warm, so
+pre-warm it from a networked terminal:
+
+```bash
+echo '{}' | uv run --quiet --script <plugin-root>/hooks/langfuse_hook.py
+```
+
+Without a usable runtime the hook exits without tracing, never blocks or slows
+Claude Code, and logs the reason, see [Troubleshooting](#troubleshooting).
 
 ## Install
 
@@ -9,18 +54,21 @@ claude plugin marketplace add langfuse/Claude-Observability-Plugin
 claude plugin install langfuse-observability@langfuse-observability
 ```
 
-The marketplace command registers the plugin marketplace and refreshes its local cache. The install command enables the plugin for your Claude Code user scope.
+The marketplace command registers the plugin marketplace and refreshes its local
+cache. The install command enables the plugin for your Claude Code user scope.
+Restart Claude Code afterwards so the hook configuration is loaded.
 
-Restart Claude Code after install so the hook configuration is loaded.
+## Add your Langfuse credentials
 
-Then configure the plugin from within a Claude Code session. This is a Claude Code slash command, not a shell command. Run `claude` first, then type it at the session prompt:
+Configure the plugin from inside a Claude Code session. This is a Claude Code
+slash command, not a shell command:
 
 ```text
 $ claude
 > /plugin configure langfuse-observability@langfuse-observability
 ```
 
-Alternatively, pass configuration values during install:
+Alternatively, pass the values during install:
 
 ```bash
 claude plugin install langfuse-observability@langfuse-observability \
@@ -29,125 +77,75 @@ claude plugin install langfuse-observability@langfuse-observability \
   --config LANGFUSE_BASE_URL=https://cloud.langfuse.com
 ```
 
-The plugin requires or accepts:
+Only `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are required; without
+`LANGFUSE_BASE_URL` the plugin uses `https://cloud.langfuse.com` (EU region).
+Get keys from your Langfuse project settings → API Keys. The secret key is held
+in your OS keychain, not in a file.
 
-| Field                 | Description                                                                                          |
-| --------------------- | ---------------------------------------------------------------------------------------------------- |
-| `LANGFUSE_SECRET_KEY` | Your Langfuse secret key (`sk-lf-...`). Stored in your OS keychain.                                  |
-| `LANGFUSE_PUBLIC_KEY` | Your Langfuse public key (`pk-lf-...`).                                                              |
-| `LANGFUSE_BASE_URL`   | https://cloud.langfuse.com (default, EU), https://us.cloud.langfuse.com for US, or your self-hosted URL. |
-| `LANGFUSE_USER_ID`    | Optional. User identifier attached to every trace (shown as the user in Langfuse).                   |
-| `CC_LANGFUSE_DEBUG`   | Verbose logging to `~/.claude/state/langfuse_hook.log`.                                              |
-| `CC_LANGFUSE_MAX_CHARS` | Truncate captured inputs/outputs to this many characters (default 20000).                          |
-| `CC_LANGFUSE_SKILL_TAGS` | Tag traces with `skill:<name>` for every skill invoked in the turn (default true).                 |
-| `CC_LANGFUSE_CAPTURE_SKILL_CONTENT` | Include injected skill instruction text in the Skill tool span output (default false).  |
-| `CC_LANGFUSE_CAPTURE_IMAGES` | Upload images to Langfuse and show them in the trace (default `true`). This includes pasted images and screenshots from tool results. Media upload must be available on your Langfuse deployment (self-hosted: `LANGFUSE_S3_MEDIA_UPLOAD_*`); if it is not, set this option to `false`. If the option is `false`, the trace shows a marker for each image, for example `[image image/png ~200KB]`. The hook then also sets `LANGFUSE_MEDIA_UPLOAD_ENABLED=false` to stop automatic uploads by the SDK. If you set that variable yourself, the hook does not change it. Do not set `LANGFUSE_MEDIA_UPLOAD_ENABLED=false` while capture is on: the trace then shows image references without content. |
-| `CC_LANGFUSE_STATE_DIR` | Optional. Absolute directory (`~` is expanded) for the hook's state, lock and log files (default `~/.claude/state`) — set per `CLAUDE_CONFIG_DIR` installation to keep them separate. Unusable values fall back to the default with a logged warning. |
-| `CC_LANGFUSE_TRACE_SEED` | Optional. Opt-in seed for deterministic trace IDs — see [Deterministic trace IDs](#deterministic-trace-ids). |
-| `CC_LANGFUSE_TRACEPARENT` | Optional, per run (env var, not plugin config). W3C traceparent of an existing trace to attach to — see [Attach runs to an existing trace](#attach-runs-to-an-existing-trace). |
-| `CC_LANGFUSE_PARENT_TRACE_ID` / `CC_LANGFUSE_PARENT_SPAN_ID` | Optional, per run. Explicit alternative to `CC_LANGFUSE_TRACEPARENT` (32-hex trace id + 16-hex span id). |
+## Configuration options
 
-Get keys from your Langfuse project settings → API Keys.
+Set these through `/plugin configure` or `--config`, unless the table says the
+value is a per-run environment variable.
 
-## Requirements
+| Option | Description | Required |
+| ------ | ----------- | -------- |
+| `LANGFUSE_SECRET_KEY` | Your Langfuse secret key (`sk-lf-...`). Held in your OS keychain. | Yes |
+| `LANGFUSE_PUBLIC_KEY` | Your Langfuse public key (`pk-lf-...`). | Yes |
+| `LANGFUSE_BASE_URL` | Langfuse host. EU: `https://cloud.langfuse.com`, US: `https://us.cloud.langfuse.com`, or your self-hosted URL. | No (defaults to EU) |
+| `LANGFUSE_USER_ID` | User identifier attached to every trace, shown as the user in Langfuse. | No |
+| `CC_LANGFUSE_DEBUG` | Verbose logging to the hook log (default `false`). | No |
+| `CC_LANGFUSE_MAX_CHARS` | Truncate captured inputs and outputs to this many characters (default `20000`). | No |
+| `CC_LANGFUSE_SKILL_TAGS` | Tag traces with `skill:<name>` for every skill invoked in the turn (default `true`). | No |
+| `CC_LANGFUSE_CAPTURE_SKILL_CONTENT` | Include injected skill instruction text in the Skill tool span output (default `false`). | No |
+| `CC_LANGFUSE_CAPTURE_IMAGES` | Upload images to Langfuse and show them in the trace (default `true`). Needs media upload on your deployment (self-hosted: `LANGFUSE_S3_MEDIA_UPLOAD_*`). Set it to `false` if media upload is unavailable: the trace then shows a marker per image, such as `[image image/png ~200KB]`. | No |
+| `CC_LANGFUSE_STATE_DIR` | Absolute directory (`~` is expanded) for the hook's state, lock and log files (default `~/.claude/state`). Set one per `CLAUDE_CONFIG_DIR` installation to keep them apart. An unusable value falls back to the default and logs a warning. | No |
+| `CC_LANGFUSE_TRACE_SEED` | Seed that makes trace IDs predictable, so a headless caller can derive a run's trace ID before the trace exists. Use a unique seed per session, otherwise sessions collide on the same trace IDs. | No |
+| `CC_LANGFUSE_TRACEPARENT` | Per-run environment variable. W3C traceparent of an existing trace to attach to — see [Attach runs to an existing trace](#attach-runs-to-an-existing-trace). | No |
+| `CC_LANGFUSE_PARENT_TRACE_ID` / `CC_LANGFUSE_PARENT_SPAN_ID` | Per-run environment variables. Explicit alternative to `CC_LANGFUSE_TRACEPARENT` (32-hex trace id plus 16-hex span id). | No |
 
-One of:
+## Update
 
-- [uv](https://docs.astral.sh/uv/) (recommended) on `PATH`. The hook uses `uv run --script` and installs the Langfuse SDK from the script metadata automatically.
-- Python 3.10+ as `python3` with `langfuse>=4.7,<5` installed in that Python environment. This is only used as a fallback when `uv` is not on `PATH`.
-
-On the first hook run, uv downloads the Langfuse SDK from PyPI (declared in the script header) and caches it. Offline or proxied machines fail this download and retry on every turn until the cache is warm; you can pre-warm it from a networked terminal:
+Updates are manual since auto-update is off by default for marketplaces outside Anthropic's.
 
 ```bash
-echo '{}' | uv run --quiet --script <plugin-root>/hooks/langfuse_hook.py
+claude plugin marketplace update langfuse-observability
+claude plugin update langfuse-observability@langfuse-observability
 ```
 
-If no usable runtime is set up, the hook exits without tracing, and Claude Code is never blocked or slowed. Failure reasons are written to `~/.claude/state/langfuse_hook.log` (see Troubleshooting).
+The marketplace command pulls the current code from GitHub into the local
+marketplace clone. Restart Claude Code
+afterwards so the new hook is loaded.
 
-## How it works
+To see which version is installed:
 
-A hook reads the session transcript incrementally on every turn (Stop) and at session end (SessionEnd), and emits a Langfuse trace with one span per turn, nested generations per assistant message, and child tool spans for every tool call. Token usage is captured when present.
-
-The plugin observes only data that Claude Code exposes through hooks and transcript files.
-
-Captured:
-
-- Claude Code CLI sessions
-- Claude Code GUI Code mode sessions
-
-Not captured:
-
-- Regular Claude Desktop Chat mode conversations
-
-If you use the desktop app, switch to Code mode for hook-backed tracing. Regular Chat mode does not invoke Claude Code Stop or SessionEnd hooks and does not write the transcript file this plugin reads.
-
-State is kept in `~/.claude/state/langfuse_state.json` so re-runs only emit new turns.
-
-## Deterministic trace IDs
-
-By default, trace IDs are auto-generated, so external systems (CI harnesses, benchmark
-runners, dataset-experiment services) that run Claude Code headlessly have to poll the
-Langfuse API to discover the trace ID of a run. Setting `CC_LANGFUSE_TRACE_SEED` makes
-trace IDs predictable: any system that knows the seed can compute the trace ID of each
-turn **before** the trace exists.
-
-With the seed set, the trace ID for turn `N` (1-based, counted per session across hook
-runs) is derived as:
-
-```python
-from langfuse import Langfuse
-
-trace_id = Langfuse.create_trace_id(seed=f"{CC_LANGFUSE_TRACE_SEED}:{turn_number}")
-# equivalent to: hashlib.sha256(f"{seed}:{turn_number}".encode()).hexdigest()[:32]
+```bash
+claude plugin list
 ```
 
-Use a **unique seed per session** — otherwise two sessions collide on the same trace
-IDs. The recommended seed is the Claude session UUID you already pass via
-`claude -p --session-id`.
+## Enable and disable tracing
 
-Example: a harness runs a single-turn headless prompt and links the resulting trace to
-a Langfuse dataset run item without ever fetching the trace:
+| Scope | How |
+| ----- | --- |
+| Change the settings | `/plugin configure langfuse-observability@langfuse-observability` in a session |
+| Stop tracing new sessions | `claude plugin disable langfuse-observability@langfuse-observability --scope user` |
+| Start tracing again | `claude plugin enable langfuse-observability@langfuse-observability --scope user` |
+| Remove the plugin | `claude plugin uninstall langfuse-observability` |
 
-```python
-import subprocess, uuid, os
-from langfuse import Langfuse
+Disabling keeps the plugin installed and keeps your configuration. Check the
+result with `claude plugin list`.
 
-langfuse = Langfuse()
-session_id = str(uuid.uuid4())
-
-# Precompute the trace ID for turn 1 — no polling needed.
-trace_id = Langfuse.create_trace_id(seed=f"{session_id}:1")
-
-# Link it to a dataset run item BEFORE the run.
-langfuse.api.dataset_run_items.create(
-    dataset_item_id=item.id,
-    run_name="claude-code-benchmark-v1",
-    trace_id=trace_id,
-)
-
-subprocess.run(
-    ["claude", "-p", "Refactor utils.py", "--session-id", session_id],
-    env={**os.environ, "CC_LANGFUSE_TRACE_SEED": session_id},
-)
-# When the hook uploads the turn, its trace appears in Langfuse under trace_id.
-```
-
-If derivation or wiring fails for any reason, the hook falls back to an auto-generated
-trace ID (fail-open, like the rest of the hook). Unset or empty seed = unchanged behavior.
+A session that already runs loads its hooks at startup, so restart it after you
+disable the plugin. Enable and disable can be project-scoped, so run
+`claude plugin list` from the directory you work in.
 
 ## Attach runs to an existing trace
 
-When your application launches Claude Code headlessly (`claude -p`) as one step of a
-larger, already-instrumented workflow, the agent run can join your application's
-existing Langfuse trace instead of creating separate root traces. Create a span for
-the agent run in your application (this becomes the run-level node), then pass its
-trace context as environment variables when launching Claude Code:
+When your application launches Claude Code headlessly (`claude -p`) as one step
+of an already-instrumented workflow, the run can join your existing Langfuse
+trace instead of creating its own root trace. Create a span for the agent run,
+then pass its trace context when you launch Claude Code:
 
 ```python
-from langfuse import get_client
-
-langfuse = get_client()
-
 with langfuse.start_as_current_span(name="Claude Code run") as run_span:
     traceparent = f"00-{run_span.trace_id}-{run_span.id}-01"
     subprocess.run(
@@ -156,81 +154,40 @@ with langfuse.start_as_current_span(name="Claude Code run") as run_span:
     )
 ```
 
-Every conversational turn of the session (with its LLM calls, tool calls, and
-subagents) then appears as a child of your `Claude Code run` span, in your trace.
-Instead of `CC_LANGFUSE_TRACEPARENT` you can pass `CC_LANGFUSE_PARENT_TRACE_ID` and
-`CC_LANGFUSE_PARENT_SPAN_ID` explicitly.
-
-
-## Privacy
-
-This plugin transmits your Claude Code session data — conversation turns, assistant
-generations, tool calls, and token-usage statistics — to the Langfuse endpoint you
-configure (`LANGFUSE_BASE_URL`, default `https://cloud.langfuse.com`). Data is sent at the end of each turn (the
-`Stop` hook) and at session end (`SessionEnd`) using the Langfuse API keys you
-provide, which are stored in your OS keychain. No data is sent anywhere other than
-the endpoint you configure.
-
-For how Langfuse Cloud handles data it receives, see the Langfuse privacy policy:
-https://langfuse.com/privacy . When using a self-hosted Langfuse instance, your data
-stays within your own infrastructure.
-
-## Reconfigure
-
-In Claude Code, run:
-
-```text
-/plugin configure langfuse-observability@langfuse-observability
-```
-
-## Disable tracing
-
-To stop tracing for new Claude Code CLI sessions and new Claude Code GUI Code mode sessions, disable the plugin:
-
-```bash
-claude plugin disable langfuse-observability@langfuse-observability --scope user
-claude plugin list
-```
-
-`claude plugin list` should show the plugin as disabled. This keeps the plugin installed and does not delete your configuration.
-
-To enable tracing again:
-
-```bash
-claude plugin enable langfuse-observability@langfuse-observability --scope user
-```
-
-If a Claude Code session is already running, restart it after disabling the plugin. Running sessions may have loaded their hooks at startup, so disabling the plugin is intended for new sessions.
-
-## Uninstall
-
-```bash
-claude plugin uninstall langfuse-observability
-```
+Every turn of the session, with its model calls, tool calls and subagents, then
+appears under your `Claude Code run` span. `CC_LANGFUSE_PARENT_TRACE_ID` and
+`CC_LANGFUSE_PARENT_SPAN_ID` are an explicit alternative to the traceparent.
 
 ## Troubleshooting
 
-Nearly every failure explains itself in `~/.claude/state/langfuse_hook.log` (with a usable `CC_LANGFUSE_STATE_DIR` override the log lives there instead; a rejected override logs to the default path). Send one message, then match the newest lines against this table:
+Nearly every failure explains itself in `~/.claude/state/langfuse_hook.log`, or
+in `CC_LANGFUSE_STATE_DIR` if you set a usable one. Send one message, then match
+the newest lines against this table:
 
-| What the log shows | Meaning | What to do |
-| --- | --- | --- |
-| No new lines at all | The hook never launched. Either the plugin is disabled, no usable runtime was found (no `uv`, no suitable `python3`), or uv could not download the SDK (offline/proxy) | Run `claude plugin list` **from the directory you use in the app**, since enable/disable can be project-scoped. Install uv and make sure it is on the PATH of the app that launches Claude Code. Pre-warm the SDK download (see Requirements) |
-| `langfuse import failed (…) python=… PATH=…` | The Python that ran the hook cannot import the SDK; the line names the interpreter, version, and PATH | Install uv and make sure it is on the PATH the hook inherits (the log line shows that PATH), or make sure `python3` is 3.10+ with `langfuse>=4.7,<5` installed |
-| `Langfuse config incomplete: missing …` | The named key(s) did not reach the hook. Either not configured yet, or configured but not delivered | Configure via `/plugin configure`. If the line also says `loaded under plugin identity '@inline'`, see the desktop section below |
-| `Hook started` plus a skip reason (e.g. `Transcript path does not exist`) | The hook ran and skipped intentionally; these often come from background/utility sessions | Usually harmless. File an issue with the log line if actual turns are missing |
-| `Processed N turns …` but nothing in Langfuse | Turns were handed to the SDK but delivery failed afterwards; export errors go to stderr, not this log | Check `LANGFUSE_BASE_URL` (EU `https://cloud.langfuse.com` vs US `https://us.cloud.langfuse.com`), key validity, and network/proxy reachability |
+| What the log shows | What to do |
+| ------------------ | ---------- |
+| No new lines at all | The hook never launched: the plugin is disabled, no usable runtime was found, or uv could not download the SDK. Run `claude plugin list` from the directory you use, and put uv on the `PATH` of the app that launches Claude Code. |
+| `langfuse import failed (…) python=… PATH=…` | The Python that ran the hook cannot import the SDK. The line names the interpreter and PATH. Install uv on that PATH, or make `python3` a 3.10+ environment with `langfuse>=4.7,<5`. |
+| `Langfuse config incomplete: missing …` | The named keys did not reach the hook. Configure them with `/plugin configure`. If the line also says `loaded under plugin identity '@inline'`, see below. |
+| `Hook started` plus a skip reason | The hook ran and skipped on purpose, which is usual for background sessions. Report it with the log line if real turns are missing. |
+| `Processed N turns …` but nothing in Langfuse | Delivery failed after the SDK took the turns. Check `LANGFUSE_BASE_URL` (EU against US), key validity, and proxy reachability. |
 
-`Hook started` and other `[DEBUG]` lines require debug logging (`CC_LANGFUSE_DEBUG=true` via `/plugin configure`); the failure lines above are written at `[INFO]` and appear without it. Regular Claude Desktop **Chat** mode is not hook-backed. Tracing covers the `claude` CLI and desktop **Code** mode.
+`Hook started` and other `[DEBUG]` lines need `CC_LANGFUSE_DEBUG`. The failure
+lines above are `[INFO]` and appear without it.
 
 ### Desktop app (GUI) sessions
 
-GUI apps do not read your shell profile. `export`ed variables in `~/.zshrc` never reach GUI-spawned hooks, and the app resolves its `PATH` once at launch. After installing uv, fully quit and relaunch the desktop app. Keys must be configured via `/plugin configure` (or `--config` at install), not via shell exports.
+A GUI app does not read your shell profile and resolves `PATH` once at launch, so
+a variable you `export` in `~/.zshrc` never reaches a GUI-spawned hook. After you
+install uv, fully quit and relaunch the app, and set keys through
+`/plugin configure` rather than shell exports.
 
-### Plugin options not delivered in GUI sessions
-
-Recent Claude Desktop builds load user-installed plugins under a different plugin identity (`langfuse-observability@inline`), so keys configured via `/plugin configure` are not delivered to the hook. Terminal sessions work, desktop sessions stay silent. When this happens, the log line contains `loaded under plugin identity '@inline'`.
-
-As a **temporary workaround**, duplicate your full options under the inline identity in `~/.claude/settings.json`:
+Recent Claude Desktop builds also load user-installed plugins under a second
+plugin identity (`langfuse-observability@inline`), so keys from
+`/plugin configure` never reach the hook: terminal sessions work while desktop
+sessions stay silent. The log line then contains
+`loaded under plugin identity '@inline'`. As a temporary workaround, repeat your
+options under that identity in `~/.claude/settings.json`:
 
 ```json
 "pluginConfigs": {
@@ -244,8 +201,20 @@ As a **temporary workaround**, duplicate your full options under the inline iden
 }
 ```
 
-The entry must include `LANGFUSE_SECRET_KEY` because the OS-keychain secret only applies to the installed identity. This stores the secret in plaintext, so consider a dedicated API key pair for the workaround period and remove the entry once it is no longer needed. No restart is needed; settings are picked up on the next message.
+The entry needs `LANGFUSE_SECRET_KEY`, because the keychain secret applies only
+to the installed identity. It is plain text, so use a dedicated key pair and
+remove the entry once it is no longer needed. Settings are read on the next
+message, with no restart.
+
+## Development
+
+```bash
+uv run --group dev pytest
+```
+
+The hook is a single uv script with inline dependency metadata, and Claude Code
+runs `hooks/langfuse_hook.py` directly, so there is no build step.
 
 ## License
 
-MIT
+[MIT](./LICENSE)
