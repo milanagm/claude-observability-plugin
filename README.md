@@ -16,7 +16,8 @@ turn, so tracing needs no change to the way you work:
 - **Agent turns**: one trace per user prompt, with all turns of a session grouped
   under one session ID.
 - **Model generations**: every assistant message with inputs, outputs, cost and
-  token usage, including cache-read and reasoning splits.
+  token usage, including cache reads and a cache write split by the lifetime it
+  was written under, which each carry their own rate.
 - **Tool calls**: each tool Claude Code invokes, with input and output.
 - **Subagents**: subagent and Workflow-spawned agent transcripts nest under the
   turn that started them.

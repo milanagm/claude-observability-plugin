@@ -589,6 +589,31 @@ def get_model(row: Dict[str, Any]) -> str:
         return m.get("model") or "claude"
     return "claude"
 
+CACHE_WRITE_TTL_KEYS = (
+    ("ephemeral_5m_input_tokens", "input_cache_creation_5m"),
+    ("ephemeral_1h_input_tokens", "input_cache_creation_1h"),
+)
+
+def get_cache_write_details(usage: Dict[str, Any]) -> Dict[str, int]:
+    """Map cache-write tokens onto the price key for each lifetime.
+
+    The flat total says nothing about the lifetime, so it is priced at the
+    cheaper rate. Use it only when the message omits the split.
+    """
+    details: Dict[str, int] = {}
+    split = usage.get("cache_creation")
+    if isinstance(split, dict):
+        for src, dst in CACHE_WRITE_TTL_KEYS:
+            v = split.get(src)
+            if isinstance(v, int) and v > 0:
+                details[dst] = v
+    if details:
+        return details
+    v = usage.get("cache_creation_input_tokens")
+    if isinstance(v, int) and v > 0:
+        return {"cache_creation_input_tokens": v}
+    return {}
+
 def get_usage_details_from_row(row: Dict[str, Any]) -> Optional[Dict[str, int]]:
     """Extract Anthropic token usage from an assistant message, if present."""
     m = row.get("message")
@@ -602,11 +627,11 @@ def get_usage_details_from_row(row: Dict[str, Any]) -> Optional[Dict[str, int]]:
         ("input_tokens", "input"),
         ("output_tokens", "output"),
         ("cache_read_input_tokens", "cache_read_input_tokens"),
-        ("cache_creation_input_tokens", "cache_creation_input_tokens"),
     ):
         v = u.get(src)
         if isinstance(v, int) and v > 0:
             details[dst] = v
+    details.update(get_cache_write_details(u))
     return details or None
 
 def get_speed_from_row(row: Dict[str, Any]) -> Optional[str]:
