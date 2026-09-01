@@ -3096,7 +3096,7 @@ def main() -> int:
 
     config = get_langfuse_config()
     if config is None:
-        debug("No LANGFUSE_PUBLIC_KEY/SECRET_KEY in environment; nothing to do")
+        log_missing_langfuse_config()
         return 0
 
     payload = read_hook_payload()
