@@ -2315,9 +2315,10 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
         )
         generation_start_timestamp = previous_timestamp or assistant_timestamp
         # A generation is only complete when its emitted form cannot change
-        # anymore: (a) every tool_use of this message has its result (end
-        # time), (b) no earlier async launch is unresolved (a late
-        # notification would retroactively join this generation's input).
+        # anymore and its tool spans can ship with it: (a) every tool_use of
+        # this message has its result (the tool span end), (b) no earlier
+        # async launch is unresolved (a late notification would retroactively
+        # join this generation's input).
         # The trailing message needs no extra guard: Stop only fires after a
         # response is fully written, and no message.id ever grows across a
         # Stop boundary (0 cases across all local transcripts).
@@ -2364,18 +2365,17 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
             emitted_tools.latest_end_timestamp,
         )
 
-        generation_end_timestamp = (
-            max(emitted_tools.result_timestamps)
-            if emitted_tools.result_timestamps
-            else assistant_timestamp
+        generation_end_timestamp = _get_latest_timestamp(
+            assistant_timestamp or previous_timestamp,
+            generation_start_timestamp,
         )
         if generation_span is not None:
-            generation_span.end(
-                end_time=to_otel_nanoseconds(
-                    generation_end_timestamp or assistant_timestamp or previous_timestamp
-                )
-            )
-        latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, generation_end_timestamp)
+            generation_span.end(end_time=to_otel_nanoseconds(generation_end_timestamp))
+        latest_end_timestamp = _get_latest_timestamp(
+            latest_end_timestamp,
+            generation_end_timestamp,
+            *emitted_tools.result_timestamps,
+        )
 
         for tool_use in tool_uses:
             entry = turn.tool_results_by_id.get(str(tool_use.get("id") or ""))
