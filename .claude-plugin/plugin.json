@@ -63,6 +63,12 @@
       "description": "Upload images to Langfuse and show them in the trace. This includes pasted images and screenshots from tool results. Your Langfuse deployment must support media upload. Set to false to show short text markers instead.",
       "default": true
     },
+    "CC_LANGFUSE_CAPTURE_HISTORY": {
+      "type": "boolean",
+      "title": "Capture conversation history",
+      "description": "Record the conversation up to that point as the input of each LLM call, like the model received it, including images. Set to false to record only the messages since the previous call.",
+      "default": true
+    },
     "CC_LANGFUSE_STATE_DIR": {
       "type": "string",
       "title": "State directory",

@@ -40,6 +40,7 @@ DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
 CAPTURE_IMAGES = (_opt("CC_LANGFUSE_CAPTURE_IMAGES") or "true").lower() == "true"
+CAPTURE_HISTORY = (_opt("CC_LANGFUSE_CAPTURE_HISTORY") or "true").lower() == "true"
 try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
 except ValueError:
@@ -1872,6 +1873,93 @@ def build_generation_output(assistant_text: str, tool_uses: List[Dict[str, Any]]
         ]
     return output
 
+
+# ---- Generation input history ----
+def build_user_history_content(user_row: Dict[str, Any]) -> Any:
+    """The user message for the history: text, plus the images of that turn.
+
+    Each image stays at the position where it entered the conversation, so
+    the history shows it the way the model received it.
+    """
+    user_content = get_content_from_row(user_row)
+    user_text, _ = truncate_text(extract_text_from_content(user_content))
+    user_media = [
+        media for media in (media_from_image_block(block) for block in get_image_blocks(user_content))
+        if media is not None
+    ]
+    return [user_text, *user_media] if user_media else user_text
+
+
+def build_turn_history_messages(turn: Turn) -> List[Dict[str, Any]]:
+    """The ChatML view of one turn, in the shape of the live generation payloads.
+
+    Order: user message, then for each assistant step the generation output
+    and one tool message with the step results. An async result appears at
+    its launch step with the final output, not at its arrival time.
+    """
+    messages: List[Dict[str, Any]] = [
+        {"role": "user", "content": build_user_history_content(turn.user_msg)}
+    ]
+    for assistant_message in turn.assistant_msgs:
+        assistant_text, _ = truncate_text(
+            extract_text_from_content(get_content_from_row(assistant_message))
+        )
+        tool_uses = get_tool_use_blocks(get_content_from_row(assistant_message))
+        messages.append(build_generation_output(assistant_text, tool_uses))
+        tool_results: List[Dict[str, Any]] = []
+        for tool_use in tool_uses:
+            entry = turn.tool_results_by_id.get(str(tool_use.get("id") or ""))
+            if entry is None:
+                continue
+            result = get_tool_result_for_observation(entry)
+            output = result.final_output if result.final_output is not None else result.output
+            tool_results.append({
+                "tool_use_id": tool_use.get("id"),
+                "tool_name": tool_use.get("name"),
+                "output": output,
+            })
+        if tool_results:
+            messages.append({"role": "tool", "tool_results": tool_results})
+    return messages
+
+
+@dataclass
+class SessionHistory:
+    """Flat ChatML view of the whole transcript, with one index per turn."""
+    messages: List[Dict[str, Any]] = field(default_factory=list)
+    start_index_by_user_row_uuid: Dict[str, int] = field(default_factory=dict)
+
+    def prefix_for_turn(self, user_row_uuid: Any) -> Optional[List[Dict[str, Any]]]:
+        """All messages before the given turn, or None when the turn is unknown."""
+        if not isinstance(user_row_uuid, str) or not user_row_uuid:
+            return None
+        start_index = self.start_index_by_user_row_uuid.get(user_row_uuid)
+        if start_index is None:
+            return None
+        return self.messages[:start_index]
+
+
+def build_session_history(
+    transcript_path: Path,
+    task_id_to_tool_use_id: Optional[Dict[str, str]] = None,
+) -> Optional[SessionHistory]:
+    """Rebuild the conversation of the whole transcript file as ChatML.
+
+    Reads from byte 0 on purpose: the emission offset only tracks what was
+    exported, while a generation input needs every earlier message.
+    """
+    rows = read_subagent_jsonl(transcript_path)
+    if not rows:
+        return None
+    history = SessionHistory()
+    for turn in build_turns(rows, task_id_to_tool_use_id):
+        user_row_uuid = turn.user_msg.get("uuid")
+        if isinstance(user_row_uuid, str) and user_row_uuid:
+            history.start_index_by_user_row_uuid.setdefault(user_row_uuid, len(history.messages))
+        history.messages.extend(build_turn_history_messages(turn))
+    return history
+
+
 # ---- Tool observations ----
 @dataclass
 class ToolResultForObservation:
@@ -2338,16 +2426,29 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
                            generation_name: str = "LLM Call",
                            subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
                            cursor: Optional[EmissionCursor] = None,
-                           workflow_agent_transcripts_by_run_id: Optional[WorkflowAgentTranscriptsByRunId] = None) -> Optional[datetime]:
+                           workflow_agent_transcripts_by_run_id: Optional[WorkflowAgentTranscriptsByRunId] = None,
+                           history_prefix: Optional[List[Dict[str, Any]]] = None) -> Optional[datetime]:
     """Emit a turn's generations and tool observations under an existing span.
 
     The full turn is always walked so cross-observation context (generation
     inputs from previous tool results, timestamps) stays correct; the cursor
     only gates which spans are actually created. Without a cursor everything
     is emitted (one-shot behavior).
+
+    With history_prefix set, each generation input is the conversation up to
+    that point: the prefix, this turn's user message, and the earlier steps
+    of this turn. Without it, inputs keep the delta form.
     """
     cursor = cursor if cursor is not None else fresh_cursor()
     user_text, _ = truncate_text(extract_text_from_content(get_content_from_row(turn.user_msg)))
+    history_messages: Optional[List[Dict[str, Any]]] = None
+    if history_prefix is not None:
+        history_messages = list(history_prefix)
+        # Same shape as in build_turn_history_messages, so this turn sees its
+        # own images the way later turns see them in the history.
+        history_messages.append(
+            {"role": "user", "content": build_user_history_content(turn.user_msg)}
+        )
     previous_timestamp = start_timestamp
     previous_tool_results: List[Dict[str, Any]] = []
     pending_async_tool_results: List[Dict[str, Any]] = []
@@ -2387,6 +2488,11 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
             )
             previous_timestamp = _get_latest_timestamp(previous_timestamp, ready_async_result_timestamp)
 
+        if history_messages is not None and ready_async_tool_results:
+            history_messages.append({
+                "role": "tool",
+                "tool_results": [result["tool_result"] for result in ready_async_tool_results],
+            })
         generation_kwargs, tool_uses = build_generation_kwargs(
             assistant_index,
             assistant_message,
@@ -2394,6 +2500,9 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
             previous_tool_results,
             ready_async_tool_results,
         )
+        if history_messages is not None:
+            generation_kwargs["input"] = list(history_messages)
+            generation_kwargs["metadata"]["history"] = {"messages": len(history_messages)}
         generation_start_timestamp = previous_timestamp or assistant_timestamp
         # A generation is only complete when its emitted form cannot change
         # anymore: (a) every tool_use of this message has its result (end
@@ -2464,6 +2573,14 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
                 not isinstance(entry, dict) or entry.get("final_content") is None
             ):
                 unresolved_async_launch_seen = True
+
+        if history_messages is not None:
+            history_messages.append(generation_kwargs["output"])
+            if emitted_tools.tool_results:
+                history_messages.append({
+                    "role": "tool",
+                    "tool_results": emitted_tools.tool_results,
+                })
 
         previous_tool_results = emitted_tools.tool_results
         if emitted_tools.result_timestamps:
@@ -2587,6 +2704,9 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
 
     latest_end_timestamp = subagent_start_timestamp
     previous_start_timestamp = subagent_start_timestamp
+    # The agent transcript is complete on disk, so history accumulates
+    # across its turns the same way as in the main conversation.
+    subagent_history: Optional[List[Dict[str, Any]]] = [] if CAPTURE_HISTORY else None
     for turn in turns:
         latest_turn_timestamp = emit_turn_observations(
             langfuse,
@@ -2595,7 +2715,10 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
             previous_start_timestamp,
             generation_name=generation_name,
             subagent_transcripts_by_tool_use_id=None,
+            history_prefix=list(subagent_history) if subagent_history is not None else None,
         )
+        if subagent_history is not None:
+            subagent_history.extend(build_turn_history_messages(turn))
         latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, latest_turn_timestamp)
         if latest_turn_timestamp is not None:
             previous_start_timestamp = latest_turn_timestamp
@@ -2613,7 +2736,7 @@ def read_subagent_jsonl(path: Path) -> Optional[List[Dict[str, Any]]]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except Exception as e:
-        info(f"subagent transcript read failed ({path}): {type(e).__name__}: {e}")
+        info(f"transcript read failed ({path}): {type(e).__name__}: {e}")
         return None
 
     rows: List[Dict[str, Any]] = []
@@ -2624,10 +2747,10 @@ def read_subagent_jsonl(path: Path) -> Optional[List[Dict[str, Any]]]:
         try:
             row = json.loads(line)
         except Exception as e:
-            info(f"subagent transcript line skipped ({path}:{line_number}): {type(e).__name__}: {e}")
+            info(f"transcript line skipped ({path}:{line_number}): {type(e).__name__}: {e}")
             continue
         if not isinstance(row, dict):
-            info(f"subagent transcript line skipped ({path}:{line_number}): expected JSON object")
+            info(f"transcript line skipped ({path}:{line_number}): expected JSON object")
             continue
         rows.append(row)
     return rows
@@ -2735,12 +2858,10 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
     trace id derived from seed and turn number; otherwise the
     session:user-row-uuid carrier pins the trace id.
     """
-    user_content = get_content_from_row(turn.user_msg)
-    user_text, user_text_meta = truncate_text(extract_text_from_content(user_content))
-    # Pasted images attach only to the turn's root input, so each image
-    # uploads once, not once for each LLM call in the turn.
-    user_media = [m for m in (media_from_image_block(b) for b in get_image_blocks(user_content)) if m is not None]
-    turn_input: Any = [user_text, *user_media] if user_media else user_text
+    _, user_text_meta = truncate_text(extract_text_from_content(get_content_from_row(turn.user_msg)))
+    # The root keeps this turn's question only, so the trace list stays
+    # scannable; the conversation history lives on the LLM call inputs.
+    root_input = {"role": "user", "content": build_user_history_content(turn.user_msg)}
     trace_metadata = build_trace_metadata(session_id, turn_num, turn, transcript_path, user_text_meta)
     if parent_context is not None:
         parent_trace_id, parent_span_id = parent_context
@@ -2754,7 +2875,7 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
             forced_trace_id=parent_trace_id,
             forced_parent_span_id=parent_span_id,
             as_root=False,
-            input={"role": "user", "content": turn_input},
+            input=root_input,
             metadata=trace_metadata,
         )
     # Opt-in deterministic trace ids: fail open to the carrier-derived id.
@@ -2772,7 +2893,7 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
         parent_otel_span=None if forced_trace_id else remote_parent(langfuse, session_id, turn.user_msg.get("uuid")),
         forced_trace_id=forced_trace_id,
         as_root=True,
-        input={"role": "user", "content": turn_input},
+        input=root_input,
         metadata=trace_metadata,
     )
 
@@ -2801,7 +2922,8 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
               close: bool = True,
               trace_seed: Optional[str] = None,
               parent_context: Optional[Tuple[str, str]] = None,
-              workflow_agent_transcripts_by_run_id: Optional[WorkflowAgentTranscriptsByRunId] = None) -> Dict[str, Any]:
+              workflow_agent_transcripts_by_run_id: Optional[WorkflowAgentTranscriptsByRunId] = None,
+              history_prefix: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Emit a turn, resuming from prior firings' progress.
 
     With no progress and close=True this is the classic one-shot emission.
@@ -2860,6 +2982,7 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
             subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
             cursor=cursor,
             workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
+            history_prefix=history_prefix,
         )
         if trace_span is not None:
             # The root exports exactly once: end time and output are the
@@ -2893,6 +3016,7 @@ def emit_and_close_ready_turns(
     trace_seed: Optional[str] = None,
     parent_context: Optional[Tuple[str, str]] = None,
     workflow_agent_transcripts_by_run_id: Optional[WorkflowAgentTranscriptsByRunId] = None,
+    session_history: Optional[SessionHistory] = None,
 ) -> int:
     emitted = 0
     # Turns without a user-row uuid bypass assign_turn_numbers; seed their
@@ -2924,6 +3048,11 @@ def emit_and_close_ready_turns(
                 trace_seed=trace_seed,
                 parent_context=parent_context,
                 workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
+                history_prefix=(
+                    session_history.prefix_for_turn(turn.user_msg.get("uuid"))
+                    if session_history is not None
+                    else None
+                ),
             )
         except Exception as e:
             # Log at INFO so SDK incompatibilities (and other emit failures)
@@ -2944,6 +3073,7 @@ def emit_ready_observations_of_open_turn(
     trace_seed: Optional[str] = None,
     parent_context: Optional[Tuple[str, str]] = None,
     workflow_agent_transcripts_by_run_id: Optional[WorkflowAgentTranscriptsByRunId] = None,
+    session_history: Optional[SessionHistory] = None,
 ) -> None:
     """Emit the held open turn once its async activity is provably resolved.
 
@@ -2988,6 +3118,11 @@ def emit_ready_observations_of_open_turn(
             trace_seed=trace_seed,
             parent_context=parent_context,
             workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
+            history_prefix=(
+                session_history.prefix_for_turn(user_row_uuid)
+                if session_history is not None
+                else None
+            ),
         )
         session_state.turn_progress[user_row_uuid] = progress
     except Exception as e:
@@ -3019,6 +3154,14 @@ def emit_new_turns_from_transcript(
             flush_deferred_agent_turns=flush_deferred_agent_turns,
         )
 
+        # One full-file pass per firing serves every turn emitted below.
+        session_history = None
+        if CAPTURE_HISTORY and (turns or session_state.open_turn):
+            session_history = build_session_history(
+                transcript_path,
+                get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id),
+            )
+
         emitted = 0
         if turns:
             turns_to_emit = get_turns_to_emit(
@@ -3037,6 +3180,7 @@ def emit_new_turns_from_transcript(
                 trace_seed=config.trace_seed,
                 parent_context=config.parent_context,
                 workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
+                session_history=session_history,
             )
 
         session_state.turn_count += emitted
@@ -3055,6 +3199,7 @@ def emit_new_turns_from_transcript(
             trace_seed=config.trace_seed,
             parent_context=config.parent_context,
             workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
+            session_history=session_history,
         )
 
         # Known limitation (accepted, like the crash-between-emit-and-save
