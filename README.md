@@ -98,7 +98,6 @@ value is a per-run environment variable.
 | `CC_LANGFUSE_SKILL_TAGS` | Tag traces with `skill:<name>` for every skill invoked in the turn (default `true`). | No |
 | `CC_LANGFUSE_CAPTURE_SKILL_CONTENT` | Include injected skill instruction text in the Skill tool span output (default `false`). | No |
 | `CC_LANGFUSE_CAPTURE_IMAGES` | Upload images to Langfuse and show them in the trace (default `true`). Needs media upload on your deployment (self-hosted: `LANGFUSE_S3_MEDIA_UPLOAD_*`). Set it to `false` if media upload is unavailable: the trace then shows a marker per image, such as `[image image/png ~200KB]`. | No |
-| `CC_LANGFUSE_CAPTURE_HISTORY` | Record the conversation up to that point as the input of every LLM call (default `true`): earlier turns, this turn's earlier steps, tool results and images, in the order the model received them. | No |
 | `CC_LANGFUSE_STATE_DIR` | Absolute directory (`~` is expanded) for the hook's state, lock and log files (default `~/.claude/state`). Set one per `CLAUDE_CONFIG_DIR` installation to keep them apart. An unusable value falls back to the default and logs a warning. | No |
 | `CC_LANGFUSE_TRACE_SEED` | Seed that makes trace IDs predictable, so a headless caller can derive a run's trace ID before the trace exists. Use a unique seed per session, otherwise sessions collide on the same trace IDs. | No |
 | `CC_LANGFUSE_TRACEPARENT` | Per-run environment variable. W3C traceparent of an existing trace to attach to — see [Attach runs to an existing trace](#attach-runs-to-an-existing-trace). | No |

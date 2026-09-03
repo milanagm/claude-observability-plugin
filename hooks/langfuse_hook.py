@@ -40,7 +40,6 @@ DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
 CAPTURE_IMAGES = (_opt("CC_LANGFUSE_CAPTURE_IMAGES") or "true").lower() == "true"
-CAPTURE_HISTORY = (_opt("CC_LANGFUSE_CAPTURE_HISTORY") or "true").lower() == "true"
 try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
 except ValueError:
@@ -2437,7 +2436,8 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
 
     With history_prefix set, each generation input is the conversation up to
     that point: the prefix, this turn's user message, and the earlier steps
-    of this turn. Without it, inputs keep the delta form.
+    of this turn. Callers pass None when the history is not available,
+    and the inputs then keep the delta form.
     """
     cursor = cursor if cursor is not None else fresh_cursor()
     user_text, _ = truncate_text(extract_text_from_content(get_content_from_row(turn.user_msg)))
@@ -2706,7 +2706,7 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
     previous_start_timestamp = subagent_start_timestamp
     # The agent transcript is complete on disk, so history accumulates
     # across its turns the same way as in the main conversation.
-    subagent_history: Optional[List[Dict[str, Any]]] = [] if CAPTURE_HISTORY else None
+    subagent_history: List[Dict[str, Any]] = []
     for turn in turns:
         latest_turn_timestamp = emit_turn_observations(
             langfuse,
@@ -2715,10 +2715,9 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
             previous_start_timestamp,
             generation_name=generation_name,
             subagent_transcripts_by_tool_use_id=None,
-            history_prefix=list(subagent_history) if subagent_history is not None else None,
+            history_prefix=list(subagent_history),
         )
-        if subagent_history is not None:
-            subagent_history.extend(build_turn_history_messages(turn))
+        subagent_history.extend(build_turn_history_messages(turn))
         latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, latest_turn_timestamp)
         if latest_turn_timestamp is not None:
             previous_start_timestamp = latest_turn_timestamp
@@ -3156,7 +3155,7 @@ def emit_new_turns_from_transcript(
 
         # One full-file pass per firing serves every turn emitted below.
         session_history = None
-        if CAPTURE_HISTORY and (turns or session_state.open_turn):
+        if turns or session_state.open_turn:
             session_history = build_session_history(
                 transcript_path,
                 get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id),

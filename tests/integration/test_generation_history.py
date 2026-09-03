@@ -283,10 +283,12 @@ def test_history_has_no_length_limit(
         )
 
 
-def test_capture_history_off_keeps_the_delta_inputs(
+def test_delta_inputs_when_the_history_cannot_be_rebuilt(
     hook_module, fake_langfuse, isolated_hook_state, tmp_path, monkeypatch
 ):
-    monkeypatch.setattr(hook_module, "CAPTURE_HISTORY", False)
+    # A transcript the history pass cannot read leaves no messages to attach.
+    # Emission then continues with the delta inputs.
+    monkeypatch.setattr(hook_module, "build_session_history", lambda *a, **kw: None)
     transcript = tmp_path / f"{SESSION}.jsonl"
     write_rows(transcript, simple_turn_rows(SESSION, 1) + simple_turn_rows(SESSION, 2))
 
