@@ -1883,10 +1883,34 @@ def build_generation_input(
         return {"role": "tool", "tool_results": tool_results}
     return None
 
-def build_generation_output(assistant_text: str, tool_uses: List[Dict[str, Any]]) -> Dict[str, Any]:
+def build_thinking_parts(content: Any) -> Tuple[List[Dict[str, str]], List[Dict[str, Any]]]:
+    """Make ChatML thinking parts from the thinking blocks of an assistant message.
+
+    Langfuse renders these parts as thinking blocks. A block without text
+    holds no reasoning, so this function skips it.
+    """
+    parts: List[Dict[str, str]] = []
+    metas: List[Dict[str, Any]] = []
+    if not isinstance(content, list):
+        return parts, metas
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "thinking":
+            continue
+        thinking_raw = block.get("thinking")
+        if not isinstance(thinking_raw, str) or not thinking_raw.strip():
+            continue
+        thinking_text, thinking_meta = truncate_text(thinking_raw)
+        parts.append({"type": "thinking", "content": thinking_text})
+        metas.append(thinking_meta)
+    return parts, metas
+
+def build_generation_output(assistant_text: str, tool_uses: List[Dict[str, Any]],
+                            thinking_parts: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
     output: Dict[str, Any] = {"role": "assistant"}
     if assistant_text:
         output["content"] = assistant_text
+    if thinking_parts:
+        output["thinking"] = thinking_parts
     if tool_uses:
         output["tool_calls"] = [
             {
@@ -2314,9 +2338,10 @@ def build_generation_kwargs(
     previous_tool_results: List[Dict[str, Any]],
     ready_async_tool_results: List[Dict[str, Any]],
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    assistant_text_raw = extract_text_from_content(get_content_from_row(assistant_message))
-    assistant_text, assistant_text_meta = truncate_text(assistant_text_raw)
-    tool_uses = get_tool_use_blocks(get_content_from_row(assistant_message))
+    assistant_content = get_content_from_row(assistant_message)
+    assistant_text, assistant_text_meta = truncate_text(extract_text_from_content(assistant_content))
+    tool_uses = get_tool_use_blocks(assistant_content)
+    thinking_parts, thinking_metas = build_thinking_parts(assistant_content)
 
     speed = get_speed_from_row(assistant_message)
 
@@ -2328,13 +2353,15 @@ def build_generation_kwargs(
             previous_tool_results,
             ready_async_tool_results,
         ),
-        output=build_generation_output(assistant_text, tool_uses),
+        output=build_generation_output(assistant_text, tool_uses, thinking_parts),
         metadata={
             "assistant_index": assistant_index,
             "assistant_text": assistant_text_meta,
             "tool_count": len(tool_uses),
         },
     )
+    if thinking_metas:
+        generation_kwargs["metadata"]["thinking"] = thinking_metas
     if speed is not None:
         generation_kwargs["metadata"]["speed"] = speed
     usage_details = get_usage_details_from_row(assistant_message)
@@ -2421,9 +2448,10 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
         )
         generation_start_timestamp = previous_timestamp or assistant_timestamp
         # A generation is only complete when its emitted form cannot change
-        # anymore: (a) every tool_use of this message has its result (end
-        # time), (b) no earlier async launch is unresolved (a late
-        # notification would retroactively join this generation's input).
+        # anymore and its tool spans can ship with it: (a) every tool_use of
+        # this message has its result (the tool span end), (b) no earlier
+        # async launch is unresolved (a late notification would retroactively
+        # join this generation's input).
         # The trailing message needs no extra guard: Stop only fires after a
         # response is fully written, and no message.id ever grows across a
         # Stop boundary (0 cases across all local transcripts).
@@ -2470,18 +2498,17 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
             emitted_tools.latest_end_timestamp,
         )
 
-        generation_end_timestamp = (
-            max(emitted_tools.result_timestamps)
-            if emitted_tools.result_timestamps
-            else assistant_timestamp
+        generation_end_timestamp = _get_latest_timestamp(
+            assistant_timestamp or previous_timestamp,
+            generation_start_timestamp,
         )
         if generation_span is not None:
-            generation_span.end(
-                end_time=to_otel_nanoseconds(
-                    generation_end_timestamp or assistant_timestamp or previous_timestamp
-                )
-            )
-        latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, generation_end_timestamp)
+            generation_span.end(end_time=to_otel_nanoseconds(generation_end_timestamp))
+        latest_end_timestamp = _get_latest_timestamp(
+            latest_end_timestamp,
+            generation_end_timestamp,
+            *emitted_tools.result_timestamps,
+        )
 
         for tool_use in tool_uses:
             entry = turn.tool_results_by_id.get(str(tool_use.get("id") or ""))
@@ -3121,7 +3148,7 @@ def main() -> int:
 
     config = get_langfuse_config()
     if config is None:
-        debug("No LANGFUSE_PUBLIC_KEY/SECRET_KEY in environment; nothing to do")
+        log_missing_langfuse_config()
         return 0
 
     payload = read_hook_payload()
